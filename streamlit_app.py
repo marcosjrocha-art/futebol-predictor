@@ -2,12 +2,12 @@
 """
 Streamlit App - Previsão de partidas (Poisson + ML opcional)
 
-Recursos:
-- Carrega 1 ou 2 URLs (duas temporadas) e combina histórico
-- (Opcional) Ponderação por recência entre temporadas (ex.: 70/30)
-- Modelo Poisson (matriz 0x0..NxN) + Top 5 mais/menos prováveis
-- Comparação com ML (RandomForest) funcional
-- Sem previsão em lote (removido conforme pedido)
+Inclui:
+- 1 ou 2 temporadas por URL + ponderação por recência (ex.: 70/30)
+- Poisson: matriz de placares, top 5 mais/menos prováveis, 1X2, Over/Under, BTTS
+- ML (RandomForest): estima lambdas e compara mercados (opcional)
+- ✅ Presets (4 modelos) via botão
+- ✅ Score de confiança (0-100) baseado na divergência Poisson x ML
 
 Rodar:
   streamlit run streamlit_app.py
@@ -34,7 +34,55 @@ from sklearn.metrics import mean_absolute_error
 
 st.set_page_config(page_title="Futebol Predictor", page_icon="⚽", layout="wide")
 st.title("⚽ Futebol Predictor — Poisson + ML (RandomForest)")
-st.caption("Carrega 1 ou 2 temporadas por URL. Pode ponderar por recência. Sem previsão em lote.")
+st.caption("2 temporadas por URL + ponderação por recência + presets + score de confiança. Sem previsão em lote.")
+
+
+# =========================
+# Presets (4 modelos)
+# =========================
+
+PRESETS = {
+    "Liga grande (equilíbrio)": {
+        "use_recency": True,
+        "w_current": 70,
+        "n_last": 8,
+        "max_goals": 5,
+        "use_ml": False,
+        "desc": "Padrão para ligas grandes: estável e realista (70/30, forma=8, matriz=5)."
+    },
+    "Liga pequena (conservador)": {
+        "use_recency": True,
+        "w_current": 60,
+        "n_last": 10,
+        "max_goals": 5,
+        "use_ml": False,
+        "desc": "Mais estável contra ruído: forma=10 e 60/40. ML desligado."
+    },
+    "Copas / mata-mata (tático)": {
+        "use_recency": False,
+        "w_current": 100,
+        "n_last": 6,
+        "max_goals": 4,
+        "use_ml": False,
+        "desc": "Mais cauteloso (menos gols e mais controle). Sem recência e sem ML."
+    },
+    "Explosivo / valor (agressivo)": {
+        "use_recency": True,
+        "w_current": 80,
+        "n_last": 6,
+        "max_goals": 6,
+        "use_ml": True,
+        "desc": "Reage rápido ao momento (80/20), matriz maior e ML ligado para auditoria."
+    }
+}
+
+def apply_preset(name: str):
+    p = PRESETS[name]
+    st.session_state["use_recency"] = p["use_recency"]
+    st.session_state["w_current"] = int(p["w_current"])
+    st.session_state["n_last"] = int(p["n_last"])
+    st.session_state["max_goals"] = int(p["max_goals"])
+    st.session_state["use_ml"] = bool(p["use_ml"])
 
 
 # =========================
@@ -49,7 +97,7 @@ def make_sample_dataset(seed: int = 42) -> pd.DataFrame:
     base_elos = {t: float(rng.integers(1450, 1850)) for t in teams}
 
     rows = []
-    for i in range(200):
+    for i in range(220):
         home, away = rng.choice(teams, size=2, replace=False)
         home_elo = base_elos[home] + float(rng.normal(0, 20))
         away_elo = base_elos[away] + float(rng.normal(0, 20))
@@ -88,13 +136,10 @@ def make_sample_dataset(seed: int = 42) -> pd.DataFrame:
 
 DIV_TO_LEAGUE = {
     "E0": "Premier League",
-    "E1": "Championship",
     "SP1": "La Liga",
     "I1": "Serie A",
     "D1": "Bundesliga",
     "F1": "Ligue 1",
-    "P1": "Primeira Liga",
-    "N1": "Eredivisie",
     "SC0": "Scottish Premiership",
     "CL": "Champions League",
 }
@@ -128,23 +173,18 @@ def _parse_date_series(s: pd.Series) -> pd.Series:
         dt = pd.to_datetime(s, errors="coerce")
     return dt
 
-def normalize_matches_dataframe(raw: pd.DataFrame, default_league_label: str = "Unknown League", season_tag: str = "") -> pd.DataFrame:
-    """
-    Converte CSV para formato interno (somente jogos com placar):
-      date, league, home_team, away_team, home_goals, away_goals, odds...
-    Ignora fixtures (linhas sem gols).
-    """
+def normalize_matches_dataframe(raw: pd.DataFrame, default_league_label: str, season_tag: str) -> pd.DataFrame:
     df = raw.copy()
 
     home_col = _first_existing(df, ["HomeTeam", "Home", "Home Team", "HT"])
     away_col = _first_existing(df, ["AwayTeam", "Away", "Away Team", "AT"])
     if home_col is None or away_col is None:
-        raise ValueError("Não achei colunas de times. Esperado HomeTeam/Home e AwayTeam/Away.")
+        raise ValueError("Não achei colunas de times. Esperado HomeTeam e AwayTeam.")
 
     hg_col = _first_existing(df, ["FTHG", "HG", "HomeGoals", "Home Goals"])
     ag_col = _first_existing(df, ["FTAG", "AG", "AwayGoals", "Away Goals"])
     if hg_col is None or ag_col is None:
-        raise ValueError("Não achei colunas de gols FT. Esperado FTHG/FTAG ou HG/AG.")
+        raise ValueError("Não achei colunas de gols FT. Esperado FTHG/FTAG.")
 
     date_col = _first_existing(df, ["Date", "date", "MatchDate"])
     if date_col is not None:
@@ -166,7 +206,6 @@ def normalize_matches_dataframe(raw: pd.DataFrame, default_league_label: str = "
     df["home_goals"] = pd.to_numeric(df[hg_col], errors="coerce")
     df["away_goals"] = pd.to_numeric(df[ag_col], errors="coerce")
 
-    # Odds opcionais
     oh, od, oa = _pick_odds_columns(df)
     if oh and od and oa:
         df["home_odds"] = pd.to_numeric(df[oh], errors="coerce")
@@ -177,11 +216,9 @@ def normalize_matches_dataframe(raw: pd.DataFrame, default_league_label: str = "
         df["draw_odds"] = np.nan
         df["away_odds"] = np.nan
 
-    # Elo default
     df["home_elo"] = 1600.0
     df["away_elo"] = 1600.0
 
-    # Somente jogos com placar
     df_played = df.dropna(subset=["home_goals", "away_goals", "date_dt"]).copy()
     df_played["home_goals"] = df_played["home_goals"].astype(int)
     df_played["away_goals"] = df_played["away_goals"].astype(int)
@@ -197,17 +234,12 @@ def normalize_matches_dataframe(raw: pd.DataFrame, default_league_label: str = "
     df_played = df_played.sort_values(["date_dt", "league", "home_team", "away_team"]).reset_index(drop=True)
     return df_played
 
-
 def combine_histories(df_current: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """
-    Combina (concat) histórico atual + anterior e remove duplicados robustamente.
-    """
     if df_prev is None:
         df = df_current.copy()
     else:
         df = pd.concat([df_current, df_prev], ignore_index=True)
 
-    # Dedup robusto (inclui gols)
     df["_key"] = (
         df["date"].astype(str) + "|" +
         df["league"].astype(str) + "|" +
@@ -217,13 +249,11 @@ def combine_histories(df_current: pd.DataFrame, df_prev: Optional[pd.DataFrame])
         df["away_goals"].astype(str)
     )
     df = df.drop_duplicates(subset=["_key"]).drop(columns=["_key"])
-
     df = df.sort_values(["date_dt", "league", "home_team", "away_team"]).reset_index(drop=True)
     return df
 
-
 @st.cache_data(show_spinner=False)
-def load_url_normalized(url: str, league_label_override: str = "", season_tag: str = "") -> pd.DataFrame:
+def load_url_normalized(url: str, league_label_override: str, season_tag: str) -> pd.DataFrame:
     raw = pd.read_csv(url)
     label = league_label_override.strip() if league_label_override.strip() else "URL Dataset"
     return normalize_matches_dataframe(raw, default_league_label=label, season_tag=season_tag)
@@ -315,7 +345,6 @@ def league_goal_averages(matches: pd.DataFrame, league: str, weights_by_season: 
     hg = df["home_goals"].astype(float).values
     ag = df["away_goals"].astype(float).values
 
-    # fallback se pesos forem ruins
     if np.all(w <= 0):
         avg_h = float(np.mean(hg))
         avg_a = float(np.mean(ag))
@@ -435,26 +464,21 @@ def probs_1x2_over_btts(mat: pd.DataFrame) -> Dict[str, float]:
 
 
 # =========================
-# ML (RandomForest) — corrigido
+# ML (RandomForest) — estável
 # =========================
 
 def build_ml_dataset(matches: pd.DataFrame, n_last: int, weights_by_season: Dict[str, float]) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """
-    Dataset supervisionado:
-    X = features de forma/médias (ponderadas por temporada, se ativado)
-    y = home_goals e away_goals
-    """
     rows = []
     ms = matches.sort_values("date_dt").reset_index(drop=True)
 
     for idx, r in ms.iterrows():
+        hist = ms.iloc[:idx]
+        if len(hist) < 10:
+            continue
+
         league = r["league"]
         home = r["home_team"]
         away = r["away_team"]
-
-        hist = ms.iloc[:idx]
-        if len(hist) < 5:
-            continue  # evita começo muito "vazio"
 
         lg = league_goal_averages(hist, league, weights_by_season)
         hf = compute_team_form(hist, home, n_last=n_last, weights_by_season=weights_by_season)
@@ -476,7 +500,6 @@ def build_ml_dataset(matches: pd.DataFrame, n_last: int, weights_by_season: Dict
             "home_elo": hf.elo,
             "away_elo": af.elo,
             "elo_diff": hf.elo - af.elo,
-            # bônus: peso da "temporada do jogo-alvo" (ajuda o modelo)
             "target_season_weight": float(weights_by_season.get(str(r.get("season_tag", "DATA")), 1.0)),
         }
 
@@ -488,14 +511,12 @@ def build_ml_dataset(matches: pd.DataFrame, n_last: int, weights_by_season: Dict
     y_away = df["y_away_goals"]
     return X, y_home, y_away
 
-
 @st.cache_resource(show_spinner=False)
 def train_ml_models_cached(matches: pd.DataFrame, n_last: int, weights_by_season: Dict[str, float], random_state: int = 42) -> Dict[str, object]:
     X, y_h, y_a = build_ml_dataset(matches, n_last=n_last, weights_by_season=weights_by_season)
     if len(X) < 80:
-        raise ValueError(f"Dataset pequeno para ML ({len(X)} linhas). Use mais histórico (2 temporadas) ou aumente dados.")
+        raise ValueError(f"Dataset pequeno para ML ({len(X)} linhas). Use 2 temporadas ou mais histórico.")
 
-    # ✅ Um único split de X e índice — aplicado aos dois targets
     idx_all = np.arange(len(X))
     idx_train, idx_val = train_test_split(idx_all, test_size=0.2, random_state=random_state, shuffle=True)
 
@@ -503,8 +524,9 @@ def train_ml_models_cached(matches: pd.DataFrame, n_last: int, weights_by_season
     yh_train, yh_val = y_h.iloc[idx_train], y_h.iloc[idx_val]
     ya_train, ya_val = y_a.iloc[idx_train], y_a.iloc[idx_val]
 
-    model_h = RandomForestRegressor(n_estimators=600, max_depth=14, random_state=random_state, n_jobs=-1)
-    model_a = RandomForestRegressor(n_estimators=600, max_depth=14, random_state=random_state, n_jobs=-1)
+    # parâmetros equilibrados (Cloud-friendly)
+    model_h = RandomForestRegressor(n_estimators=350, max_depth=12, random_state=random_state, n_jobs=-1)
+    model_a = RandomForestRegressor(n_estimators=350, max_depth=12, random_state=random_state, n_jobs=-1)
 
     model_h.fit(X_train, yh_train)
     model_a.fit(X_train, ya_train)
@@ -524,7 +546,6 @@ def train_ml_models_cached(matches: pd.DataFrame, n_last: int, weights_by_season
         "n_rows": int(len(X)),
     }
 
-
 def predict_expected_goals_ml(matches: pd.DataFrame, league: str, home_team: str, away_team: str, trained: Dict[str, object],
                               n_last: int, weights_by_season: Dict[str, float]) -> Tuple[float, float, Dict[str, float]]:
     cols = trained["feature_columns"]
@@ -533,11 +554,7 @@ def predict_expected_goals_ml(matches: pd.DataFrame, league: str, home_team: str
     hf = compute_team_form(matches, home_team, n_last=n_last, weights_by_season=weights_by_season)
     af = compute_team_form(matches, away_team, n_last=n_last, weights_by_season=weights_by_season)
 
-    # para "target_season_weight", use a média dos pesos (ou do CURRENT, se existir)
-    if "CURRENT" in weights_by_season:
-        tsw = float(weights_by_season["CURRENT"])
-    else:
-        tsw = float(np.mean(list(weights_by_season.values()))) if len(weights_by_season) else 1.0
+    tsw = float(weights_by_season.get("CURRENT", np.mean(list(weights_by_season.values())) if weights_by_season else 1.0))
 
     row = {
         "avg_home_goals_league": lg["avg_home_goals"],
@@ -559,7 +576,6 @@ def predict_expected_goals_ml(matches: pd.DataFrame, league: str, home_team: str
     }
 
     X = pd.DataFrame([row])[cols]
-
     lam_home = float(trained["model_home"].predict(X)[0])
     lam_away = float(trained["model_away"].predict(X)[0])
 
@@ -574,6 +590,31 @@ def predict_expected_goals_ml(matches: pd.DataFrame, league: str, home_team: str
         "ml_rows_used": trained["n_rows"],
     }
     return lam_home, lam_away, dbg
+
+
+# =========================
+# Confiança (0-100)
+# =========================
+
+def confidence_score_from_models(probsP: Dict[str, float], probsM: Dict[str, float]) -> Tuple[int, Dict[str, float]]:
+    """
+    Score de 0 a 100 baseado na divergência (em pontos percentuais) entre Poisson e ML.
+    Mercados usados: 1, X, 2, Over2.5, BTTS yes.
+    """
+    keys = ["home_win", "draw", "away_win", "over_2_5", "btts_yes"]
+    diffs_pp = {k: abs(probsP[k] - probsM[k]) * 100.0 for k in keys}
+    avg_diff = float(np.mean(list(diffs_pp.values())))
+
+    # mapeamento simples: 0pp => 100 | 25pp => 50 | 50pp => ~0
+    score = int(np.clip(100 - (avg_diff * 2.0), 0, 100))
+    return score, diffs_pp
+
+def confidence_label(score: int) -> str:
+    if score >= 80:
+        return "Alta"
+    if score >= 60:
+        return "Média"
+    return "Baixa"
 
 
 # =========================
@@ -598,10 +639,18 @@ def pct(x: float) -> float:
 
 
 # =========================
-# Sidebar — Fonte de dados + ponderação
+# Sidebar — Fonte + Presets + Modelo
 # =========================
 
 with st.sidebar:
+    st.header("Presets (4 modelos)")
+    preset_name = st.selectbox("Escolha um preset", list(PRESETS.keys()), index=0, key="preset_name")
+    st.caption(PRESETS[preset_name]["desc"])
+    if st.button("Aplicar preset agora"):
+        apply_preset(preset_name)
+        st.rerun()
+
+    st.divider()
     st.header("Fonte de dados")
     source = st.radio("Escolha a fonte", ["URL (1 ou 2 temporadas)", "Dataset fictício"], index=0)
 
@@ -610,26 +659,49 @@ with st.sidebar:
     league_override = ""
 
     if source == "URL (1 ou 2 temporadas)":
-        st.caption("URL 1 = temporada atual (CURRENT). URL 2 = anterior (PREV).")
+        st.caption("URL 1 = CURRENT. URL 2 = PREV (opcional).")
         url1 = st.text_input("URL CSV (Temporada atual)", value="https://www.football-data.co.uk/mmz4281/2526/E0.csv")
         url2 = st.text_input("URL CSV (Temporada anterior - opcional)", value="https://www.football-data.co.uk/mmz4281/2425/E0.csv")
         league_override = st.text_input("Opcional: nome da liga (override)", value="")
 
-        use_recency = st.checkbox("Usar ponderação por recência entre temporadas", value=True)
-        w_current_pct = st.slider("Peso temporada atual (%)", 50, 95, 70, 1, disabled=not use_recency)
-        w_prev_pct = 100 - w_current_pct
-
-        st.caption(f"Peso anterior = {w_prev_pct}%")
-    else:
-        use_recency = False
-        w_current_pct = 100
-        w_prev_pct = 0
-
     st.divider()
     st.header("Modelo")
-    n_last = st.slider("Últimos N jogos (forma)", 5, 10, 8)
-    max_goals = st.slider("Máximo de gols na matriz", 3, 7, 5)
-    use_ml = st.checkbox("Comparar com ML (RandomForest)", value=False)
+
+    use_recency = st.checkbox(
+        "Usar ponderação por recência entre temporadas",
+        value=st.session_state.get("use_recency", True),
+        key="use_recency"
+    )
+
+    w_current = st.slider(
+        "Peso temporada atual (%)",
+        50, 95,
+        value=int(st.session_state.get("w_current", 70)),
+        step=1,
+        disabled=not use_recency,
+        key="w_current"
+    )
+    st.caption(f"Peso anterior = {100 - int(w_current)}%")
+
+    n_last = st.slider(
+        "Últimos N jogos (forma)",
+        5, 10,
+        value=int(st.session_state.get("n_last", 8)),
+        key="n_last"
+    )
+
+    max_goals = st.slider(
+        "Máximo de gols na matriz",
+        3, 7,
+        value=int(st.session_state.get("max_goals", 5)),
+        key="max_goals"
+    )
+
+    use_ml = st.checkbox(
+        "Comparar com ML (RandomForest)",
+        value=bool(st.session_state.get("use_ml", False)),
+        key="use_ml"
+    )
 
 
 # =========================
@@ -639,19 +711,16 @@ with st.sidebar:
 try:
     if source == "Dataset fictício":
         played = make_sample_dataset()
-        df_current = played.copy()
-        df_prev = None
         has_two_seasons = False
     else:
         if not url1.strip():
             st.stop()
-
-        df_current = load_url_normalized(url1.strip(), league_label_override=league_override, season_tag="CURRENT")
+        df_current = load_url_normalized(url1.strip(), league_override, "CURRENT")
 
         df_prev = None
         has_two_seasons = bool(url2.strip())
         if has_two_seasons:
-            df_prev = load_url_normalized(url2.strip(), league_label_override=league_override, season_tag="PREV")
+            df_prev = load_url_normalized(url2.strip(), league_override, "PREV")
 
         played = combine_histories(df_current, df_prev)
 
@@ -663,19 +732,16 @@ if played.empty:
     st.error("Nenhum jogo com placar encontrado. Histórico vazio.")
     st.stop()
 
-# Pesos por temporada
 if source == "URL (1 ou 2 temporadas)" and has_two_seasons and use_recency:
-    weights_by_season = {"CURRENT": w_current_pct / 100.0, "PREV": w_prev_pct / 100.0}
+    weights_by_season = {"CURRENT": int(w_current) / 100.0, "PREV": (100 - int(w_current)) / 100.0}
 else:
-    # sem ponderação (ou só uma temporada)
-    # mantém pesos 1.0 para tudo que aparecer
     seasons = sorted(played["season_tag"].astype(str).unique().tolist())
     weights_by_season = {s: 1.0 for s in seasons}
 
-# Info
 n_current = int((played["season_tag"] == "CURRENT").sum()) if "season_tag" in played.columns else len(played)
 n_prev = int((played["season_tag"] == "PREV").sum()) if "season_tag" in played.columns else 0
-st.info(f"Histórico carregado: **{len(played)} jogos** | CURRENT: {n_current} | PREV: {n_prev} | Pesos: {weights_by_season}")
+
+st.info(f"Histórico: **{len(played)} jogos** | CURRENT: {n_current} | PREV: {n_prev} | Pesos: {weights_by_season}")
 
 with st.expander("📄 Preview do histórico"):
     st.dataframe(played.tail(60), use_container_width=True)
@@ -741,8 +807,10 @@ with right:
     t = topP.copy()
     t["prob_%"] = t["prob_%"].astype(float).round(3)
     st.markdown("**Top 5 mais prováveis**")
-    st.dataframe(t[["placar", "prob_%"]].style.format({"prob_%": "{:.3f}%"}).background_gradient(subset=["prob_%"]),
-                 use_container_width=True)
+    st.dataframe(
+        t[["placar", "prob_%"]].style.format({"prob_%": "{:.3f}%"}).background_gradient(subset=["prob_%"]),
+        use_container_width=True
+    )
 
     b = botP.copy()
     b["prob_%"] = b["prob_%"].astype(float).round(6)
@@ -756,7 +824,7 @@ st.divider()
 
 
 # =========================
-# ML (RandomForest) — comparação
+# ML + Score de confiança
 # =========================
 
 if use_ml:
@@ -773,16 +841,22 @@ if use_ml:
         topM, botM = list_top_bottom_scores(matM, k=5)
         probsM = probs_1x2_over_btts(matM)
 
-        st.subheader("Comparação — Poisson vs ML (RandomForest)")
+        # ✅ Score de confiança (baseado em divergência)
+        score, diffs_pp = confidence_score_from_models(probsP, probsM)
+        label = confidence_label(score)
+
+        st.subheader("Comparação — Poisson vs ML (RandomForest) + Confiança")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("λ Mandante (ML)", f"{lam_h_ml:.2f}")
         c2.metric("λ Visitante (ML)", f"{lam_a_ml:.2f}")
-        c3.metric("MAE Home (val)", f"{dbgM['mae_home']:.3f}")
-        c4.metric("MAE Away (val)", f"{dbgM['mae_away']:.3f}")
-        c5.metric("Over 2.5 (ML)", f"{pct(probsM['over_2_5']):.1f}%")
-        c6.metric("BTTS (Sim) (ML)", f"{pct(probsM['btts_yes']):.1f}%")
+        c3.metric("MAE Home", f"{dbgM['mae_home']:.3f}")
+        c4.metric("MAE Away", f"{dbgM['mae_away']:.3f}")
+        c5.metric("Confiança", f"{score}/100")
+        c6.metric("Nível", label)
 
-        tab1, tab2, tab3 = st.tabs(["Heatmap ML", "Top/Bottom ML", "Resumo Mercados"])
+        st.caption("Confiança alta = Poisson e ML concordam. Confiança baixa = modelos divergentes (jogo mais incerto).")
+
+        tab1, tab2, tab3, tab4 = st.tabs(["Heatmap ML", "Top/Bottom ML", "Resumo Mercados", "Divergências"])
         with tab1:
             fig2 = heatmap_figure(matM * 100.0, "Probabilidade (%) por placar (ML -> λ -> Poisson)")
             st.pyplot(fig2, clear_figure=True)
@@ -793,8 +867,10 @@ if use_ml:
                 tm = topM.copy()
                 tm["prob_%"] = tm["prob_%"].astype(float).round(3)
                 st.markdown("**Top 5 mais prováveis (ML)**")
-                st.dataframe(tm[["placar", "prob_%"]].style.format({"prob_%": "{:.3f}%"}).background_gradient(subset=["prob_%"]),
-                             use_container_width=True)
+                st.dataframe(
+                    tm[["placar", "prob_%"]].style.format({"prob_%": "{:.3f}%"}).background_gradient(subset=["prob_%"]),
+                    use_container_width=True
+                )
             with r:
                 bm = botM.copy()
                 bm["prob_%"] = bm["prob_%"].astype(float).round(6)
@@ -820,10 +896,20 @@ if use_ml:
                 use_container_width=True
             )
 
+        with tab4:
+            dd = pd.DataFrame({
+                "Mercado": ["1 (Mandante)", "X (Empate)", "2 (Visitante)", "Over 2.5", "BTTS Sim"],
+                "Diferença (p.p.)": [
+                    diffs_pp["home_win"], diffs_pp["draw"], diffs_pp["away_win"], diffs_pp["over_2_5"], diffs_pp["btts_yes"]
+                ],
+            })
+            st.dataframe(dd.style.format({"Diferença (p.p.)": "{:.2f}"}).background_gradient(subset=["Diferença (p.p.)"]),
+                         use_container_width=True)
+
         with st.expander("🔎 Detalhes do ML"):
             st.json(dbgM)
 
     except Exception as e:
         st.error(f"Falha ao treinar/rodar ML: {e}")
 
-st.caption("Dica: com 2 temporadas, a ponderação 70/30 costuma estabilizar médias sem perder a 'cara' da temporada atual.")
+st.caption("Dica: use os presets para alternar entre perfis (conservador, equilíbrio, mata-mata, agressivo).")
