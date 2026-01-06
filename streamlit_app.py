@@ -8,11 +8,12 @@ Inclui:
 - ML (RandomForest): estima lambdas e compara mercados (opcional)
 - Presets (4 modelos) via botão
 - Score de confiança (0-100) baseado na divergência Poisson x ML
-
-✅ Extras adicionados:
-- Alertas visuais automáticos (verde/amarelo/vermelho) por mercado
-- Mercado recomendado automático (com justificativa)
-- Frases prontas de análise (texto pronto pra copiar)
+- Alertas visuais por mercado (verde/amarelo/vermelho)
+- Mercado recomendado automático (Top 1 + alternativas)
+- Texto automático de análise do jogo
+✅ NOVO:
+- Perfil de risco (Conservador/Equilibrado/Agressivo) impacta recomendações
+- Alerta de extremos de λ (Poisson/ML) para evitar previsões “explodidas”
 
 Rodar:
   streamlit run streamlit_app.py
@@ -529,7 +530,6 @@ def train_ml_models_cached(matches: pd.DataFrame, n_last: int, weights_by_season
     yh_train, yh_val = y_h.iloc[idx_train], y_h.iloc[idx_val]
     ya_train, ya_val = y_a.iloc[idx_train], y_a.iloc[idx_val]
 
-    # parâmetros equilibrados (Cloud-friendly)
     model_h = RandomForestRegressor(n_estimators=350, max_depth=12, random_state=random_state, n_jobs=-1)
     model_a = RandomForestRegressor(n_estimators=350, max_depth=12, random_state=random_state, n_jobs=-1)
 
@@ -598,15 +598,25 @@ def predict_expected_goals_ml(matches: pd.DataFrame, league: str, home_team: str
 
 
 # =========================
-# Confiança (0-100) + Alertas + Mercado recomendado + Texto pronto
+# Confiança + Alertas + Recomendação + Texto
 # =========================
 
+MARKET_LABELS = {
+    "home_win": "1 (Mandante)",
+    "draw": "X (Empate)",
+    "away_win": "2 (Visitante)",
+    "over_2_5": "Over 2.5",
+    "under_2_5": "Under 2.5",
+    "btts_yes": "BTTS Sim",
+    "btts_no": "BTTS Não",
+}
+
 def confidence_score_from_models(probsP: Dict[str, float], probsM: Dict[str, float]) -> Tuple[int, Dict[str, float]]:
-    keys = ["home_win", "draw", "away_win", "over_2_5", "btts_yes"]
-    diffs_pp = {k: abs(probsP[k] - probsM[k]) * 100.0 for k in keys}
-    avg_diff = float(np.mean(list(diffs_pp.values())))
+    main_keys = ["home_win", "draw", "away_win", "over_2_5", "btts_yes"]
+    diffs_pp_all = {k: abs(probsP[k] - probsM[k]) * 100.0 for k in MARKET_LABELS.keys()}
+    avg_diff = float(np.mean([diffs_pp_all[k] for k in main_keys]))
     score = int(np.clip(100 - (avg_diff * 2.0), 0, 100))
-    return score, diffs_pp
+    return score, diffs_pp_all
 
 def confidence_label(score: int) -> str:
     if score >= 80:
@@ -615,114 +625,162 @@ def confidence_label(score: int) -> str:
         return "Média"
     return "Baixa"
 
-def market_alert_level(diff_pp: float) -> Tuple[str, str]:
-    """
-    Retorna (label, emoji):
-      Verde: < 8 p.p.
-      Amarelo: 8..15 p.p.
-      Vermelho: > 15 p.p.
-    """
-    if diff_pp < 8.0:
-        return ("Bom (consenso)", "🟢")
+def market_level(diff_pp: float) -> str:
+    if diff_pp <= 8.0:
+        return "verde"
     if diff_pp <= 15.0:
-        return ("Atenção", "🟡")
-    return ("Arriscado", "🔴")
+        return "amarelo"
+    return "vermelho"
 
-def _avg_prob(p: float, m: float) -> float:
-    return 0.5*(float(p) + float(m))
+def lambda_extremes(lh: float, la: float) -> Tuple[bool, List[str]]:
+    msgs = []
+    extreme = False
+    # limites práticos para futebol (heurística)
+    if lh >= 3.50:
+        extreme = True
+        msgs.append(f"λ mandante muito alto ({lh:.2f}) → risco de superestimar goleada.")
+    if la >= 3.50:
+        extreme = True
+        msgs.append(f"λ visitante muito alto ({la:.2f}) → risco de superestimar goleada.")
+    if lh <= 0.30:
+        extreme = True
+        msgs.append(f"λ mandante muito baixo ({lh:.2f}) → risco de subestimar gols do mandante.")
+    if la <= 0.30:
+        extreme = True
+        msgs.append(f"λ visitante muito baixo ({la:.2f}) → risco de subestimar gols do visitante.")
+    return extreme, msgs
 
-def recommend_market(probsP: Dict[str, float], probsM: Dict[str, float], diffs_pp: Dict[str, float]) -> Tuple[str, str, float, float]:
+def risk_profile_params(profile: str) -> Dict[str, object]:
     """
-    Escolhe um mercado recomendado automaticamente.
-    Critério: baixa divergência + probabilidade razoável.
-    Retorna (mercado_nome, motivo, prob_poisson, prob_ml).
+    Ajusta recomendações:
+    - Conservador: prioriza prob alta, evita mercados voláteis (1X2).
+    - Equilibrado: padrão.
+    - Agressivo: permite mais mercados e aceita prob menor se divergência for baixa.
     """
-    candidates = [
-        ("Over 2.5", "over_2_5"),
-        ("Under 2.5", "under_2_5"),
-        ("BTTS Sim", "btts_yes"),
-        ("BTTS Não", "btts_no"),
-        ("1 (Mandante)", "home_win"),
-        ("X (Empate)", "draw"),
-        ("2 (Visitante)", "away_win"),
-    ]
+    if profile == "Conservador":
+        return {
+            "allowed": {"over_2_5", "under_2_5", "btts_yes", "btts_no"},  # evita 1X2
+            "w_diff": 2.0,
+            "w_prob": 1.6,
+            "min_prob": 0.55,
+        }
+    if profile == "Agressivo":
+        return {
+            "allowed": set(MARKET_LABELS.keys()),
+            "w_diff": 2.2,
+            "w_prob": 0.9,
+            "min_prob": 0.40,
+        }
+    # Equilibrado
+    return {
+        "allowed": set(MARKET_LABELS.keys()),
+        "w_diff": 2.0,
+        "w_prob": 1.2,
+        "min_prob": 0.50,
+    }
 
-    # divergência só existe para 5 chaves; para as complementares, herdamos (Under=Over, BTTS Não=BTTS Sim)
-    def get_diff(key: str) -> float:
-        if key in diffs_pp:
-            return float(diffs_pp[key])
-        if key == "under_2_5":
-            return float(diffs_pp.get("over_2_5", 999.0))
-        if key == "btts_no":
-            return float(diffs_pp.get("btts_yes", 999.0))
-        return 999.0
+def recommended_markets(
+    probsP: Dict[str, float],
+    probsM: Dict[str, float],
+    diffs_pp: Dict[str, float],
+    profile: str
+) -> List[Dict[str, object]]:
+    params = risk_profile_params(profile)
+    allowed = params["allowed"]
+    w_diff = float(params["w_diff"])
+    w_prob = float(params["w_prob"])
+    min_prob = float(params["min_prob"])
 
-    scored = []
-    for name, key in candidates:
-        pP = float(probsP.get(key, 0.0))
-        pM = float(probsM.get(key, 0.0))
-        diff = get_diff(key)
-        avgp = _avg_prob(pP, pM)
+    items = []
+    for k, label in MARKET_LABELS.items():
+        if k not in allowed:
+            continue
 
-        # penaliza mercados com muita divergência e prob muito baixa
-        # objetivo: “melhor consenso útil”, não “maior prob a qualquer custo”
-        score = (avgp * 100.0) - (diff * 2.2)
-        scored.append((score, name, key, diff, pP, pM, avgp))
+        p_avg = 0.5 * (probsP[k] + probsM[k])
+        diff = float(diffs_pp[k])
+        lvl = market_level(diff)
 
-    scored.sort(reverse=True, key=lambda x: x[0])
-    best = scored[0]
-    _, name, key, diff, pP, pM, avgp = best
+        # penalidade por divergência e prob baixa
+        prob_penalty = 0.0
+        if p_avg < min_prob:
+            prob_penalty = (min_prob - p_avg) * 100.0  # em pontos
 
-    lbl, emo = market_alert_level(diff)
-    motivo = f"{emo} {lbl}. Consenso entre modelos (diferença ~{diff:.2f} p.p.) e probabilidade média ~{avgp*100:.1f}%."
-    return name, motivo, pP, pM
+        # score menor é melhor
+        lvl_score = {"verde": 0.0, "amarelo": 7.0, "vermelho": 18.0}[lvl]
+        score = (w_diff * diff) + (w_prob * (100.0 * (1.0 - p_avg))) + lvl_score + prob_penalty
 
-def generate_analysis_text(
-    league: str, home_team: str, away_team: str,
-    probsP: Dict[str, float], probsM: Dict[str, float],
-    score: int, label: str,
-    reco_name: str, reco_reason: str
+        items.append({
+            "key": k,
+            "mercado": label,
+            "diff_pp": diff,
+            "prob_avg": float(p_avg),
+            "nivel": lvl,
+            "rank_score": float(score),
+        })
+
+    items_sorted = sorted(items, key=lambda x: x["rank_score"])
+    return items_sorted[:3]
+
+def auto_analysis_text(
+    league: str,
+    home_team: str,
+    away_team: str,
+    probsP: Dict[str, float],
+    probsM: Dict[str, float],
+    diffs_pp: Dict[str, float],
+    score: int,
+    label: str,
+    lam_h: float,
+    lam_a: float,
+    lam_h_ml: float,
+    lam_a_ml: float,
+    recs: List[Dict[str, object]],
+    risk_profile: str,
+    extremes_msgs: List[str],
 ) -> str:
-    def f(x): return f"{x*100:.1f}%"
-    text = []
-    text.append(f"Análise — {league}: {home_team} x {away_team}")
-    text.append("")
-    text.append(f"Confiança do modelo: {score}/100 ({label}).")
-    text.append("")
-    text.append("1X2 (Poisson | ML):")
-    text.append(f"- Mandante: {f(probsP['home_win'])} | {f(probsM['home_win'])}")
-    text.append(f"- Empate:   {f(probsP['draw'])} | {f(probsM['draw'])}")
-    text.append(f"- Visitante:{f(probsP['away_win'])} | {f(probsM['away_win'])}")
-    text.append("")
-    text.append("Gols (Poisson | ML):")
-    text.append(f"- Over 2.5: {f(probsP['over_2_5'])} | {f(probsM['over_2_5'])}")
-    text.append(f"- BTTS Sim: {f(probsP['btts_yes'])} | {f(probsM['btts_yes'])}")
-    text.append("")
-    text.append(f"Mercado recomendado: {reco_name}")
-    text.append(f"Motivo: {reco_reason}")
-    text.append("")
-    text.append("Leitura rápida:")
-    # leitura baseada no consenso
-    avg_over = _avg_prob(probsP["over_2_5"], probsM["over_2_5"])
-    avg_btts = _avg_prob(probsP["btts_yes"], probsM["btts_yes"])
-    avg_home = _avg_prob(probsP["home_win"], probsM["home_win"])
-    avg_away = _avg_prob(probsP["away_win"], probsM["away_win"])
-    if avg_over >= 0.58:
-        text.append("- Tendência de jogo com gols (Over 2.5 alto).")
-    else:
-        text.append("- Tendência mais contida em gols (Over 2.5 moderado/baixo).")
-    if avg_btts >= 0.55:
-        text.append("- Cenário favorável para ambos marcarem (BTTS Sim).")
-    else:
-        text.append("- Cenário menos favorável para BTTS (atenção).")
-    if abs(avg_home - avg_away) < 0.06:
-        text.append("- Jogo relativamente equilibrado no 1X2.")
-    elif avg_home > avg_away:
-        text.append("- Leve viés para o mandante no 1X2.")
-    else:
-        text.append("- Leve viés para o visitante no 1X2.")
+    avg_1 = 0.5 * (probsP["home_win"] + probsM["home_win"])
+    avg_x = 0.5 * (probsP["draw"] + probsM["draw"])
+    avg_2 = 0.5 * (probsP["away_win"] + probsM["away_win"])
+    fav = "Mandante" if avg_1 >= max(avg_x, avg_2) else ("Visitante" if avg_2 >= max(avg_1, avg_x) else "Empate")
+    fav_pct = max(avg_1, avg_x, avg_2) * 100.0
 
-    return "\n".join(text)
+    over_avg = 0.5 * (probsP["over_2_5"] + probsM["over_2_5"]) * 100.0
+    btts_avg = 0.5 * (probsP["btts_yes"] + probsM["btts_yes"]) * 100.0
+
+    worst = sorted([(MARKET_LABELS[k], diffs_pp[k]) for k in ["home_win","draw","away_win","btts_yes","over_2_5"]], key=lambda x: x[1], reverse=True)[:2]
+    w1, w2 = worst[0], worst[1]
+
+    top1 = recs[0]
+    alt = [r["mercado"] for r in recs[1:]]
+
+    texto = []
+    texto.append(f"**{home_team} x {away_team} ({league})**")
+    texto.append(f"- **Perfil de risco:** **{risk_profile}** (isso muda o ranking de recomendações).")
+    texto.append(f"- **Confiança:** {score}/100 (**{label}**) — quanto mais alta, mais Poisson e ML concordam.")
+    texto.append(f"- **Gols esperados (Poisson):** {lam_h:.2f} x {lam_a:.2f} | **Gols esperados (ML):** {lam_h_ml:.2f} x {lam_a_ml:.2f}")
+    texto.append(f"- **Tendência de resultado:** leve viés para **{fav}** (~{fav_pct:.1f}%).")
+    texto.append(f"- **Tendência de gols:** Over 2.5 ~**{over_avg:.1f}%** | BTTS (Sim) ~**{btts_avg:.1f}%** (médias Poisson+ML).")
+
+    if extremes_msgs:
+        texto.append("")
+        texto.append("**⚠️ Alerta de extremos (λ):**")
+        for m in extremes_msgs:
+            texto.append(f"- {m}")
+        texto.append("Sugestão: aumente o histórico (2 temporadas) e/ou use perfil Conservador para recomendações.")
+
+    texto.append("")
+    texto.append("**✅ Mercado recomendado (pela consistência entre modelos + perfil de risco):**")
+    texto.append(f"- **{top1['mercado']}** — divergência **{top1['diff_pp']:.2f} p.p.**, prob. média **{top1['prob_avg']*100:.1f}%** ({top1['nivel']}).")
+    if alt:
+        texto.append(f"- Alternativas: {', '.join(alt)}")
+
+    texto.append("")
+    texto.append("**⚠️ Pontos de atenção (onde os modelos mais discordam):**")
+    texto.append(f"- {w1[0]}: **{w1[1]:.2f} p.p.**")
+    texto.append(f"- {w2[0]}: **{w2[1]:.2f} p.p.**")
+    texto.append("")
+    texto.append("**Leitura rápida:** divergência alta em 1X2/BTTS = evite esses mercados e priorize os mercados com alerta verde.")
+    return "\n".join(texto)
 
 
 # =========================
@@ -747,7 +805,7 @@ def pct(x: float) -> float:
 
 
 # =========================
-# Sidebar — Fonte + Presets + Modelo
+# Sidebar — Fonte + Presets + Modelo + Perfil de risco
 # =========================
 
 with st.sidebar:
@@ -809,6 +867,15 @@ with st.sidebar:
         "Comparar com ML (RandomForest)",
         value=bool(st.session_state.get("use_ml", False)),
         key="use_ml"
+    )
+
+    st.divider()
+    st.header("Recomendação")
+    risk_profile = st.selectbox(
+        "Perfil de risco",
+        ["Conservador", "Equilibrado", "Agressivo"],
+        index=1,
+        help="Controla o ranking do 'mercado recomendado'. Conservador evita 1X2 e prioriza probabilidade mais alta."
     )
 
 
@@ -904,6 +971,13 @@ c8.metric("BTTS (Sim)", f"{pct(probsP['btts_yes']):.1f}%")
 c9.metric("BTTS (Não)", f"{pct(probsP['btts_no']):.1f}%")
 c10.metric("Total gols (liga, médio)", f"{league_goal_averages(played, league, weights_by_season)['avg_total_goals']:.2f}")
 
+# ✅ Alerta de extremos (Poisson)
+extP, msgsP = lambda_extremes(lam_h, lam_a)
+if extP:
+    st.warning("⚠️ Alerta: λ extremo no Poisson. Isso pode distorcer placares e mercados.")
+    for m in msgsP:
+        st.caption(f"- {m}")
+
 left, right = st.columns([1.2, 1])
 with left:
     st.subheader("Matriz de placares — Poisson")
@@ -932,7 +1006,7 @@ st.divider()
 
 
 # =========================
-# ML + Confiança + Extras (alerta/recomendação/texto)
+# ML + Confiança + Alertas + Recomendação + Texto
 # =========================
 
 if use_ml:
@@ -952,9 +1026,8 @@ if use_ml:
         score, diffs_pp = confidence_score_from_models(probsP, probsM)
         label = confidence_label(score)
 
-        # ✅ Mercado recomendado + texto pronto
-        reco_name, reco_reason, reco_pP, reco_pM = recommend_market(probsP, probsM, diffs_pp)
-        analysis_text = generate_analysis_text(league, home_team, away_team, probsP, probsM, score, label, reco_name, reco_reason)
+        # ✅ Recomendações respeitando perfil de risco
+        recs = recommended_markets(probsP, probsM, diffs_pp, profile=risk_profile)
 
         st.subheader("Comparação — Poisson vs ML (RandomForest) + Confiança")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -965,23 +1038,67 @@ if use_ml:
         c5.metric("Confiança", f"{score}/100")
         c6.metric("Nível", label)
 
-        # ✅ Alertas globais (barra)
-        if score >= 80:
-            st.success("🟢 Confiança alta: Poisson e ML concordam bem. Bom para mercados principais.")
-        elif score >= 60:
-            st.warning("🟡 Confiança média: há divergências pontuais. Prefira mercados onde os modelos concordam.")
-        else:
-            st.error("🔴 Confiança baixa: modelos discordam bastante. Jogo mais incerto — cuidado com mercados agressivos.")
+        # ✅ Alerta de extremos (ML)
+        extM, msgsM = lambda_extremes(lam_h_ml, lam_a_ml)
+        extremes_msgs = []
+        if extP:
+            extremes_msgs.extend([f"(Poisson) {m}" for m in msgsP])
+        if extM:
+            extremes_msgs.extend([f"(ML) {m}" for m in msgsM])
 
-        # ✅ Mercado recomendado (automático)
-        st.markdown("### ✅ Mercado recomendado (automático)")
-        st.info(f"**{reco_name}** — Poisson: {reco_pP*100:.1f}% | ML: {reco_pM*100:.1f}%  \n{reco_reason}")
+        if extM:
+            st.warning("⚠️ Alerta: λ extremo no ML. Use com cautela (pode ser poucos dados/viés recente).")
+            for m in msgsM:
+                st.caption(f"- {m}")
 
-        # ✅ Texto pronto
-        with st.expander("📝 Frases prontas (copiar/usar)"):
-            st.text_area("Texto gerado automaticamente", value=analysis_text, height=260)
+        st.markdown("### ✅ Alertas por mercado (consistência Poisson × ML)")
+        st.caption("Verde: modelos concordam | Amarelo: divergência moderada | Vermelho: divergência alta (mais risco).")
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Heatmap ML", "Top/Bottom ML", "Resumo Mercados", "Divergências", "Alertas Visuais"])
+        cols = st.columns(7)
+        keys_order = ["home_win", "draw", "away_win", "over_2_5", "under_2_5", "btts_yes", "btts_no"]
+        for i, k in enumerate(keys_order):
+            diff = float(diffs_pp[k])
+            lvl = market_level(diff)
+            text = f"{MARKET_LABELS[k]}\n{diff:.1f} p.p."
+            if lvl == "verde":
+                cols[i].success(text)
+            elif lvl == "amarelo":
+                cols[i].warning(text)
+            else:
+                cols[i].error(text)
+
+        st.markdown("### 🎯 Mercado recomendado (automático)")
+        st.caption(f"Perfil aplicado: **{risk_profile}**")
+        top1 = recs[0]
+        st.info(
+            f"**Top 1:** {top1['mercado']} — divergência **{top1['diff_pp']:.2f} p.p.** | "
+            f"prob. média (Poisson+ML) **{top1['prob_avg']*100:.1f}%** | nível: **{top1['nivel']}**"
+        )
+        if len(recs) > 1:
+            alt_str = " | ".join([f"{r['mercado']} ({r['diff_pp']:.1f} p.p.)" for r in recs[1:]])
+            st.caption(f"Alternativas: {alt_str}")
+
+        st.markdown("### 📝 Análise automática do jogo")
+        analysis = auto_analysis_text(
+            league=league,
+            home_team=home_team,
+            away_team=away_team,
+            probsP=probsP,
+            probsM=probsM,
+            diffs_pp=diffs_pp,
+            score=score,
+            label=label,
+            lam_h=lam_h,
+            lam_a=lam_a,
+            lam_h_ml=lam_h_ml,
+            lam_a_ml=lam_a_ml,
+            recs=recs,
+            risk_profile=risk_profile,
+            extremes_msgs=extremes_msgs,
+        )
+        st.markdown(analysis)
+
+        tab1, tab2, tab3, tab4 = st.tabs(["Heatmap ML", "Top/Bottom ML", "Resumo Mercados", "Divergências"])
         with tab1:
             fig2 = heatmap_figure(matM * 100.0, "Probabilidade (%) por placar (ML -> λ -> Poisson)")
             st.pyplot(fig2, clear_figure=True)
@@ -1004,17 +1121,9 @@ if use_ml:
 
         with tab3:
             cmp = pd.DataFrame({
-                "Mercado": ["1 (Mandante)", "X (Empate)", "2 (Visitante)", "Over 2.5", "Under 2.5", "BTTS Sim", "BTTS Não"],
-                "Poisson (%)": [
-                    100*probsP["home_win"], 100*probsP["draw"], 100*probsP["away_win"],
-                    100*probsP["over_2_5"], 100*probsP["under_2_5"],
-                    100*probsP["btts_yes"], 100*probsP["btts_no"]
-                ],
-                "ML (%)": [
-                    100*probsM["home_win"], 100*probsM["draw"], 100*probsM["away_win"],
-                    100*probsM["over_2_5"], 100*probsM["under_2_5"],
-                    100*probsM["btts_yes"], 100*probsM["btts_no"]
-                ],
+                "Mercado": [MARKET_LABELS[k] for k in keys_order],
+                "Poisson (%)": [100*probsP[k] for k in keys_order],
+                "ML (%)": [100*probsM[k] for k in keys_order],
             })
             st.dataframe(
                 cmp.style.format({"Poisson (%)": "{:.2f}", "ML (%)": "{:.2f}"}).background_gradient(subset=["Poisson (%)", "ML (%)"]),
@@ -1023,45 +1132,14 @@ if use_ml:
 
         with tab4:
             dd = pd.DataFrame({
-                "Mercado": ["1 (Mandante)", "X (Empate)", "2 (Visitante)", "Over 2.5", "BTTS Sim"],
-                "Diferença (p.p.)": [
-                    diffs_pp["home_win"], diffs_pp["draw"], diffs_pp["away_win"], diffs_pp["over_2_5"], diffs_pp["btts_yes"]
-                ],
+                "Mercado": [MARKET_LABELS[k] for k in keys_order],
+                "Diferença (p.p.)": [diffs_pp[k] for k in keys_order],
+                "Nível": [market_level(diffs_pp[k]) for k in keys_order],
             })
             st.dataframe(
                 dd.style.format({"Diferença (p.p.)": "{:.2f}"}).background_gradient(subset=["Diferença (p.p.)"]),
                 use_container_width=True
             )
-
-        # ✅ Alertas visuais por mercado (verde/amarelo/vermelho)
-        with tab5:
-            st.markdown("### 🚦 Alertas visuais por mercado (baseado na divergência Poisson × ML)")
-            rows = []
-            mapping = [
-                ("1 (Mandante)", "home_win"),
-                ("X (Empate)", "draw"),
-                ("2 (Visitante)", "away_win"),
-                ("Over 2.5", "over_2_5"),
-                ("BTTS Sim", "btts_yes"),
-            ]
-            for name, key in mapping:
-                diff = float(diffs_pp[key])
-                lbl, emo = market_alert_level(diff)
-                rows.append({
-                    "Mercado": name,
-                    "Alerta": f"{emo} {lbl}",
-                    "Diferença (p.p.)": diff,
-                    "Poisson (%)": 100*float(probsP[key]),
-                    "ML (%)": 100*float(probsM[key]),
-                })
-
-            alert_df = pd.DataFrame(rows).sort_values("Diferença (p.p.)")
-            st.dataframe(
-                alert_df.style
-                    .format({"Diferença (p.p.)": "{:.2f}", "Poisson (%)": "{:.2f}", "ML (%)": "{:.2f}"}),
-                use_container_width=True
-            )
-            st.caption("🟢 < 8 p.p. = consenso forte | 🟡 8–15 p.p. = atenção | 🔴 > 15 p.p. = arriscado")
 
         with st.expander("🔎 Detalhes do ML"):
             st.json(dbgM)
@@ -1069,4 +1147,4 @@ if use_ml:
     except Exception as e:
         st.error(f"Falha ao treinar/rodar ML: {e}")
 
-st.caption("Dica: use os presets para alternar entre perfis (conservador, equilíbrio, mata-mata, agressivo).")
+st.caption("Dica: perfil de risco muda o ranking; alerta de extremos avisa quando λ está fora do padrão esperado.")
