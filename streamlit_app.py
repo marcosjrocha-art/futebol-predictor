@@ -32,6 +32,15 @@ from scipy.stats import poisson
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
+
+from odds_api import (
+    LEAGUE_TO_SPORT_KEY,
+    get_odds_api_key,
+    get_quota_headers,
+    fetch_best_h2h_odds,
+    match_event_best_prices,
+    implied_probs_from_decimal_odds,
+)
 from sklearn.calibration import calibration_curve
 
 
@@ -975,6 +984,42 @@ def plot_reliability(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10, t
 # =========================
 
 with st.sidebar:
+    st.divider()
+    st.header("The Odds API (odds)")
+
+    use_odds_api = st.checkbox(
+        "Usar odds (1X2) para comparar/EV",
+        value=False,
+        help="Lê odds do mercado 1X2 (h2h). Usa st.secrets['ODDS_API_KEY'] no Cloud."
+    )
+
+    odds_region = st.selectbox(
+        "Região (bookmakers)",
+        ["eu", "uk", "us", "us2", "au"],
+        index=0,
+        disabled=not use_odds_api
+    )
+
+    # Fallback automático de chave: secrets -> env -> input
+    api_key = get_odds_api_key()
+    if use_odds_api and not api_key:
+        st.text_input(
+            "ODDS_API_KEY (fallback local)",
+            type="password",
+            key="odds_api_key_input",
+            help="Se não houver secret/env, você pode inserir aqui (não salva no Git)."
+        )
+        api_key = get_odds_api_key()
+
+    if use_odds_api and api_key:
+        q = get_quota_headers(api_key)
+        if q.get("remaining") is not None:
+            st.metric("Quota restante", q["remaining"])
+        if q.get("used") is not None:
+            st.caption(f"Usadas: {q['used']} | Última: {q.get('last')}")
+        if q.get("status_code") and q["status_code"] != 200:
+            st.warning(f"Quota check retornou HTTP {q['status_code']} (pode ser temporário).")
+
     st.header("Presets")
     preset_name = st.selectbox("Escolha um preset", list(PRESETS.keys()), index=0, key="preset_name")
     st.caption(PRESETS[preset_name]["desc"])
