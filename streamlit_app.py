@@ -48,10 +48,102 @@ from sklearn.calibration import calibration_curve
 # UI
 # =========================
 
+# =========================
+# BOOTSTRAP — Produção/Decisão (sempre antes de qualquer uso)
+# =========================
+def is_production_mode() -> bool:
+    # Produção se botão ativo OU perfil conservador
+    if st.session_state.get("app_mode") == "PRODUCAO":
+        return True
+    if st.session_state.get("risk_profile") == "Conservador":
+        return True
+    return False
+
+def production_rules_snapshot() -> dict:
+    return {
+        "EV mínimo 1X2": float(st.session_state.get("ev_min_1x2", 0.06)),
+        "Prob mínima 1X2": float(st.session_state.get("pmin_1x2", 0.50)),
+        "Confiança mínima": int(st.session_state.get("conf_min", 75)),
+        "Filtro vermelho": True,
+        "Região odds": str(st.session_state.get("odds_region", "eu")),
+    }
+
+def production_decision(
+    recs: list,
+    confidence_score: int | None,
+    odds_available: bool,
+    ev_table=None,
+) -> tuple[str, list]:
+    """
+    Retorna: ("APOSTAR" ou "NÃO APOSTAR", motivos[])
+    Em produção: bloqueia se não houver mercado seguro / odds / EV / confiança.
+    """
+    if not is_production_mode():
+        return "LAB", ["Modo Laboratório: sem bloqueio estrito."]
+
+    rules = production_rules_snapshot()
+    ev_min = float(rules["EV mínimo 1X2"])
+    pmin = float(rules["Prob mínima 1X2"])
+    conf_min = int(rules["Confiança mínima"])
+
+    reasons = []
+
+    if not recs:
+        reasons.append("Sem mercado seguro (todos vermelhos ou filtrados).")
+
+    if confidence_score is not None and confidence_score < conf_min:
+        reasons.append(f"Confiança abaixo do mínimo ({confidence_score} < {conf_min}).")
+
+    if not odds_available:
+        reasons.append("Odds não disponíveis (não dá para validar EV).")
+
+    if ev_table is not None and getattr(ev_table, "__len__", lambda: 0)() > 0:
+        ok = False
+        for _, r in ev_table.iterrows():
+            try:
+                ev = float(r.get("EV", None))
+                prob = float(r.get("Prob (modelo)", None))
+            except Exception:
+                continue
+            if ev >= ev_min and prob >= pmin:
+                ok = True
+                break
+        if not ok:
+            reasons.append(f"Nenhuma opção 1X2 com EV≥{ev_min:.2f} e Prob≥{pmin:.2f}.")
+
+    if reasons:
+        return "NÃO APOSTAR", reasons
+    return "APOSTAR", ["Passou nos filtros do Modo Produção."]
+
+
+
+
 st.set_page_config(page_title="Futebol Predictor", page_icon="⚽", layout="wide")
+
+# init log
+if "decision_log" not in st.session_state:
+    st.session_state["decision_log"] = []
+
 st.title("⚽ Futebol Predictor — Poisson + Dixon–Coles + Elo + ML + Backtest")
 st.caption("Sem dados pagos. Compatível com football-data.co.uk. Backtest rolling e calibração para EV mais realista.")
 
+
+
+
+# =========================
+# Badge: modo ativo
+# =========================
+mode = st.session_state.get("app_mode", "")
+
+rules = production_rules_snapshot()
+if is_production_mode():
+    with st.expander("🔒 Regras de Produção ativas", expanded=False):
+        st.json(rules)
+
+if mode == "PRODUCAO":
+    st.success("🔒 **Modo Produção ativo** — filtros mais rígidos (EV maior, menos overfit).")
+elif mode == "LABORATORIO":
+    st.info("🧪 **Modo Laboratório ativo** — parâmetros mais reativos para explorar hipóteses.")
 
 # =========================
 # Presets do modelo
@@ -730,6 +822,54 @@ MARKET_LABELS = {
 }
 
 
+
+def recommended_markets(
+    probsP: Dict[str, float],
+    probsM: Dict[str, float],
+    diffs_pp: Dict[str, float],
+    profile: str
+) -> List[Dict[str, object]]:
+    params = risk_profile_params(profile)
+    allowed = params["allowed"]
+    w_diff = float(params["w_diff"])
+    w_prob = float(params["w_prob"])
+    min_prob = float(params["min_prob"])
+
+    items = []
+    for k, label in MARKET_LABELS.items():
+        if k not in allowed:
+            continue
+
+        p_avg = 0.5 * (probsP[k] + probsM[k])
+        diff = float(diffs_pp[k])
+        lvl = market_level(diff)
+
+        # 🔒 Modo Produção: bloqueia mercados vermelhos SEM EXCEÇÃO
+        if is_production_mode() and lvl == "vermelho":
+            continue
+
+        # penalidade por divergência e prob baixa
+        prob_penalty = 0.0
+        if p_avg < min_prob:
+            prob_penalty = (min_prob - p_avg) * 100.0  # em pontos
+
+        lvl_score = {"verde": 0.0, "amarelo": 7.0, "vermelho": 18.0}[lvl]
+        score = (w_diff * diff) + (w_prob * (100.0 * (1.0 - p_avg))) + lvl_score + prob_penalty
+
+        items.append({
+            "key": k,
+            "mercado": label,
+            "diff_pp": diff,
+            "prob_avg": float(p_avg),
+            "nivel": lvl,
+            "rank_score": float(score),
+        })
+
+    items_sorted = sorted(items, key=lambda x: x["rank_score"])
+    return items_sorted[:3]
+
+
+
 def confidence_score_from_models(probsP: Dict[str, float], probsM: Dict[str, float]) -> Tuple[int, Dict[str, float]]:
     main_keys = ["home_win", "draw", "away_win", "over_2_5", "btts_yes"]
     diffs_pp_all = {k: abs(probsP[k] - probsM[k]) * 100.0 for k in MARKET_LABELS.keys()}
@@ -761,31 +901,6 @@ def risk_profile_params(profile: str) -> Dict[str, object]:
         return {"allowed": set(MARKET_LABELS.keys()), "w_diff": 2.2, "w_prob": 0.9, "min_prob": 0.40}
     return {"allowed": set(MARKET_LABELS.keys()), "w_diff": 2.0, "w_prob": 1.2, "min_prob": 0.50}
 
-
-def recommended_markets(probsP: Dict[str, float], probsM: Dict[str, float], diffs_pp: Dict[str, float], profile: str) -> List[Dict[str, object]]:
-    params = risk_profile_params(profile)
-    allowed = params["allowed"]
-    w_diff = float(params["w_diff"])
-    w_prob = float(params["w_prob"])
-    min_prob = float(params["min_prob"])
-
-    items = []
-    for k, label in MARKET_LABELS.items():
-        if k not in allowed:
-            continue
-        p_avg = 0.5 * (probsP[k] + probsM[k])
-        diff = float(diffs_pp[k])
-        lvl = market_level(diff)
-        prob_penalty = 0.0
-        if p_avg < min_prob:
-            prob_penalty = (min_prob - p_avg) * 100.0
-
-        lvl_score = {"verde": 0.0, "amarelo": 7.0, "vermelho": 18.0}[lvl]
-        score = (w_diff * diff) + (w_prob * (100.0 * (1.0 - p_avg))) + lvl_score + prob_penalty
-
-        items.append({"key": k, "mercado": label, "diff_pp": diff, "prob_avg": float(p_avg), "nivel": lvl, "rank_score": float(score)})
-
-    return sorted(items, key=lambda x: x["rank_score"])[:3]
 
 
 def ev_from_odds(p: float, odds: float) -> Optional[float]:
@@ -988,9 +1103,15 @@ with st.sidebar:
     st.divider()
     st.header("🚀 Modos rápidos")
 
+    if st.button("Limpar modo (voltar ao normal)"):
+        st.session_state.pop("app_mode", None)
+        st.rerun()
+
+
     colm1, colm2 = st.columns(2)
     with colm1:
         if st.button("🔒 Modo Produção"):
+            st.session_state["app_mode"] = "PRODUCAO"
             # Produção: estabilidade, menos apostas, menos overfit
             st.session_state["use_odds_api"] = True
             st.session_state["odds_region"] = "eu"
@@ -1033,6 +1154,7 @@ with st.sidebar:
 
     with colm2:
         if st.button("🧪 Modo Laboratório"):
+            st.session_state["app_mode"] = "LABORATORIO"
             # Laboratório: mais reativo (exploração)
             st.session_state["use_odds_api"] = True
             st.session_state["odds_region"] = "eu"
@@ -1533,3 +1655,60 @@ if bt_enable:
         st.error(f"Backtest/Calibração falhou: {e}")
 
 st.caption("Pronto. Se quiser, o próximo passo é colocar sua API key da Odds API em st.secrets para deploy seguro.")
+
+
+# =========================
+# Upgrade 5 — Decisão de Produção (log)
+# =========================
+
+def production_decision(
+    recs: list,
+    is_prod: bool,
+    confidence_score: int | None,
+    odds_available: bool,
+    ev_table: "pd.DataFrame | None" = None,
+) -> tuple[str, list]:
+    """
+    Retorna: ("APOSTAR" ou "NÃO APOSTAR", motivos[])
+    - Em produção: recs vazio => NÃO APOSTAR
+    - Exige odds para EV (se odds não tiver, não aposta)
+    - Exige confiança mínima se disponível
+    - Exige EV mínimo e prob mínima no mercado 1X2 se ev_table existir
+    """
+    reasons = []
+    if not is_prod:
+        return "LAB", ["Modo Laboratório: sem bloqueio estrito."]
+
+    rules = production_rules_snapshot()
+    ev_min = rules["EV mínimo 1X2"]
+    pmin = rules["Prob mínima 1X2"]
+    conf_min = rules["Confiança mínima"]
+
+    if not recs:
+        reasons.append("Sem mercado seguro (todos vermelhos ou filtrados).")
+
+    if confidence_score is not None and confidence_score < conf_min:
+        reasons.append(f"Confiança abaixo do mínimo ({confidence_score} < {conf_min}).")
+
+    if not odds_available:
+        reasons.append("Odds não disponíveis (não dá para validar EV).")
+
+    # Se existir tabela EV (1X2), checa se há algum EV>=min e prob>=pmin
+    if ev_table is not None and len(ev_table) > 0:
+        ok = False
+        for _, r in ev_table.iterrows():
+            try:
+                ev = float(r.get("EV", None))
+                prob = float(r.get("Prob (modelo)", None))
+            except Exception:
+                continue
+            if ev >= ev_min and prob >= pmin:
+                ok = True
+                break
+        if not ok:
+            reasons.append(f"Nenhuma opção 1X2 com EV≥{ev_min:.2f} e Prob≥{pmin:.2f}.")
+
+    if reasons:
+        return "NÃO APOSTAR", reasons
+    return "APOSTAR", ["Passou nos filtros do Modo Produção."]
+
