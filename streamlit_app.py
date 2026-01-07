@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-Streamlit App - Previsão de partidas (Poisson + ML opcional)
+Futebol Predictor — Poisson + Dixon–Coles + Elo dinâmico + ML + Backtest/Calibração
 
 Inclui:
-- 1 ou 2 temporadas por URL + ponderação por recência (ex.: 70/30)
-- Poisson: matriz de placares, top 5 mais/menos prováveis, 1X2, Over/Under, BTTS
-- ML (RandomForest): estima lambdas e compara mercados (opcional)
-- Presets (4 modelos) via botão
-- Score de confiança (0-100) baseado na divergência Poisson x ML
-- Alertas visuais por mercado (verde/amarelo/vermelho)
-- Mercado recomendado automático (Top 1 + alternativas)
-- Texto automático de análise do jogo
-✅ NOVO:
-- Perfil de risco (Conservador/Equilibrado/Agressivo) impacta recomendações
-- Alerta de extremos de λ (Poisson/ML) para evitar previsões “explodidas”
-✅ NOVO (EV + Odds):
-- EV (Valor Esperado) por mercado com odds manual ou automáticas
-- Integração The Odds API (região eu) para 1X2, O/U 2.5, BTTS
-- Seleção de bookmaker ou “Best price”
+- Fonte por URL (1 ou 2 temporadas) + ponderação por recência (ex.: 70/30)
+- Normalização tolerante (football-data.co.uk e similares)
+- Elo dinâmico (jogo-a-jogo) pré-partida (Upgrade 1)
+- Poisson + Dixon–Coles (Upgrade 2): toggle + rho + preset por liga + efeito nos low-scores
+- Probabilidades: placares (0..N), Top 5 mais e menos prováveis, 1X2, Over/Under 2.5, BTTS
+- ML (RandomForest) opcional: estima lambdas e compara com Poisson
+- Confiança (0–100) pela divergência Poisson x ML
+- EV (Valor Esperado) usando odds do CSV (quando existirem)
+- Upgrade 3: Backtest rolling (sem data leakage), Brier, LogLoss, ROI EV+, reliability curve
 
 Rodar:
   streamlit run streamlit_app.py
@@ -25,125 +19,67 @@ Rodar:
 
 from __future__ import annotations
 
-import re
-import unicodedata
 import math
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-from scipy.stats import poisson
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
 
-import requests
+from scipy.stats import poisson
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
+from sklearn.calibration import calibration_curve
 
 
 # =========================
-# UI Config
+# UI
 # =========================
 
 st.set_page_config(page_title="Futebol Predictor", page_icon="⚽", layout="wide")
-st.title("⚽ Futebol Predictor — Poisson + ML (RandomForest)")
-st.caption("2 temporadas por URL + ponderação por recência + presets + score de confiança. Sem previsão em lote.")
+st.title("⚽ Futebol Predictor — Poisson + Dixon–Coles + Elo + ML + Backtest")
+st.caption("Sem dados pagos. Compatível com football-data.co.uk. Backtest rolling e calibração para EV mais realista.")
 
 
 # =========================
-# Presets (4 modelos)
+# Presets do modelo
 # =========================
 
 PRESETS = {
     "Liga grande (equilíbrio)": {
-        "use_recency": True,
-        "w_current": 70,
-        "n_last": 8,
-        "max_goals": 5,
-        "use_ml": False,
-        "desc": "Padrão para ligas grandes: estável e realista (70/30, forma=8, matriz=5)."
+        "use_recency": True, "w_current": 70, "n_last": 8, "max_goals": 5,
+        "use_ml": False, "use_dc": True, "rho": -0.06,
+        "desc": "Padrão realista: 70/30, forma=8, matriz=5, Dixon–Coles ligado."
     },
     "Liga pequena (conservador)": {
-        "use_recency": True,
-        "w_current": 60,
-        "n_last": 10,
-        "max_goals": 5,
-        "use_ml": False,
-        "desc": "Mais estável contra ruído: forma=10 e 60/40. ML desligado."
+        "use_recency": True, "w_current": 60, "n_last": 10, "max_goals": 5,
+        "use_ml": False, "use_dc": True, "rho": -0.08,
+        "desc": "Mais estável contra ruído: forma=10, 60/40. DC mais forte."
     },
     "Copas / mata-mata (tático)": {
-        "use_recency": False,
-        "w_current": 100,
-        "n_last": 6,
-        "max_goals": 4,
-        "use_ml": False,
-        "desc": "Mais cauteloso (menos gols e mais controle). Sem recência e sem ML."
+        "use_recency": False, "w_current": 100, "n_last": 6, "max_goals": 4,
+        "use_ml": False, "use_dc": True, "rho": -0.07,
+        "desc": "Menos gols e mais controle: forma=6, matriz=4. DC ligado."
     },
     "Explosivo / valor (agressivo)": {
-        "use_recency": True,
-        "w_current": 80,
-        "n_last": 6,
-        "max_goals": 6,
-        "use_ml": True,
-        "desc": "Reage rápido ao momento (80/20), matriz maior e ML ligado para auditoria."
-    }
+        "use_recency": True, "w_current": 80, "n_last": 6, "max_goals": 6,
+        "use_ml": True, "use_dc": True, "rho": -0.05,
+        "desc": "Reage rápido: 80/20, matriz=6, ML ligado como auditor."
+    },
 }
 
-def apply_preset(name: str):
+
+def apply_preset(name: str) -> None:
     p = PRESETS[name]
-    st.session_state["use_recency"] = p["use_recency"]
+    st.session_state["use_recency"] = bool(p["use_recency"])
     st.session_state["w_current"] = int(p["w_current"])
     st.session_state["n_last"] = int(p["n_last"])
     st.session_state["max_goals"] = int(p["max_goals"])
     st.session_state["use_ml"] = bool(p["use_ml"])
-
-
-# =========================
-# Dataset fictício (opcional)
-# =========================
-
-def make_sample_dataset(seed: int = 42) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-
-    league = "Premier League"
-    teams = ["Arsenal", "Liverpool", "Man City", "Chelsea", "Tottenham", "Newcastle"]
-    base_elos = {t: float(rng.integers(1450, 1850)) for t in teams}
-
-    rows = []
-    for i in range(220):
-        home, away = rng.choice(teams, size=2, replace=False)
-        home_elo = base_elos[home] + float(rng.normal(0, 20))
-        away_elo = base_elos[away] + float(rng.normal(0, 20))
-
-        elo_diff = (home_elo - away_elo) / 400.0
-        lam_home = max(0.2, 1.35 + 0.25 * elo_diff + 0.20)
-        lam_away = max(0.2, 1.10 - 0.20 * elo_diff)
-
-        hg = int(rng.poisson(lam_home))
-        ag = int(rng.poisson(lam_away))
-
-        rows.append({
-            "date": f"2025-{(i%12)+1:02d}-{(i%28)+1:02d}",
-            "league": league,
-            "home_team": home,
-            "away_team": away,
-            "home_goals": hg,
-            "away_goals": ag,
-            "home_elo": round(home_elo, 1),
-            "away_elo": round(away_elo, 1),
-            "home_odds": np.nan,
-            "draw_odds": np.nan,
-            "away_odds": np.nan,
-            "season_tag": "SAMPLE",
-        })
-
-    df = pd.DataFrame(rows)
-    df["date_dt"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date_dt"]).sort_values("date_dt").drop(columns=["date_dt"]).reset_index(drop=True)
-    return df
+    st.session_state["use_dc"] = bool(p["use_dc"])
 
 
 # =========================
@@ -156,7 +92,11 @@ DIV_TO_LEAGUE = {
     "I1": "Serie A",
     "D1": "Bundesliga",
     "F1": "Ligue 1",
+    "B1": "Jupiler Pro League",
+    "N1": "Eredivisie",
+    "P1": "Primeira Liga",
     "SC0": "Scottish Premiership",
+    "BRA": "Brasileirão",
     "CL": "Champions League",
 }
 
@@ -169,12 +109,25 @@ ODDS_CANDIDATES = [
     ("MaxH", "MaxD", "MaxA"),
 ]
 
+# Presets simples de ρ (heurístico) por liga — ajuste no slider se quiser
+DC_RHO_PRESETS = {
+    "Premier League": -0.06,
+    "La Liga": -0.07,
+    "Serie A": -0.08,
+    "Bundesliga": -0.04,
+    "Ligue 1": -0.07,
+    "Brasileirão": -0.08,
+    "Champions League": -0.06,
+}
+
+
 def _first_existing(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = set(df.columns)
     for c in candidates:
         if c in cols:
             return c
     return None
+
 
 def _pick_odds_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     cols = set(df.columns)
@@ -183,11 +136,13 @@ def _pick_odds_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], 
             return h, d, a
     return None, None, None
 
+
 def _parse_date_series(s: pd.Series) -> pd.Series:
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     if dt.isna().mean() > 0.5:
         dt = pd.to_datetime(s, errors="coerce")
     return dt
+
 
 def normalize_matches_dataframe(raw: pd.DataFrame, default_league_label: str, season_tag: str) -> pd.DataFrame:
     df = raw.copy()
@@ -195,12 +150,12 @@ def normalize_matches_dataframe(raw: pd.DataFrame, default_league_label: str, se
     home_col = _first_existing(df, ["HomeTeam", "Home", "Home Team", "HT"])
     away_col = _first_existing(df, ["AwayTeam", "Away", "Away Team", "AT"])
     if home_col is None or away_col is None:
-        raise ValueError("Não achei colunas de times. Esperado HomeTeam e AwayTeam.")
+        raise ValueError("Não encontrei colunas de times (ex.: HomeTeam e AwayTeam).")
 
     hg_col = _first_existing(df, ["FTHG", "HG", "HomeGoals", "Home Goals"])
     ag_col = _first_existing(df, ["FTAG", "AG", "AwayGoals", "Away Goals"])
     if hg_col is None or ag_col is None:
-        raise ValueError("Não achei colunas de gols FT. Esperado FTHG/FTAG.")
+        raise ValueError("Não encontrei colunas de gols FT (ex.: FTHG e FTAG).")
 
     date_col = _first_existing(df, ["Date", "date", "MatchDate"])
     if date_col is not None:
@@ -232,17 +187,18 @@ def normalize_matches_dataframe(raw: pd.DataFrame, default_league_label: str, se
         df["draw_odds"] = np.nan
         df["away_odds"] = np.nan
 
-    # (placeholder) Elo; você pode plugar Elo real depois
-    df["home_elo"] = 1600.0
-    df["away_elo"] = 1600.0
+    # placeholders (serão preenchidos pelo Elo dinâmico se habilitado)
+    df["home_elo"] = 1500.0
+    df["away_elo"] = 1500.0
 
     df_played = df.dropna(subset=["home_goals", "away_goals", "date_dt"]).copy()
     df_played["home_goals"] = df_played["home_goals"].astype(int)
     df_played["away_goals"] = df_played["away_goals"].astype(int)
 
     keep = [
-        "date", "date_dt", "league", "home_team", "away_team", "home_goals", "away_goals",
-        "home_elo", "away_elo", "home_odds", "draw_odds", "away_odds"
+        "date", "date_dt", "league", "home_team", "away_team",
+        "home_goals", "away_goals", "home_elo", "away_elo",
+        "home_odds", "draw_odds", "away_odds"
     ]
     df_played = df_played[keep].copy()
     df_played["season_tag"] = season_tag or "DATA"
@@ -250,6 +206,7 @@ def normalize_matches_dataframe(raw: pd.DataFrame, default_league_label: str, se
     df_played = df_played.dropna(subset=["date", "league", "home_team", "away_team"])
     df_played = df_played.sort_values(["date_dt", "league", "home_team", "away_team"]).reset_index(drop=True)
     return df_played
+
 
 def combine_histories(df_current: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> pd.DataFrame:
     if df_prev is None:
@@ -269,6 +226,7 @@ def combine_histories(df_current: pd.DataFrame, df_prev: Optional[pd.DataFrame])
     df = df.sort_values(["date_dt", "league", "home_team", "away_team"]).reset_index(drop=True)
     return df
 
+
 @st.cache_data(show_spinner=False)
 def load_url_normalized(url: str, league_label_override: str, season_tag: str) -> pd.DataFrame:
     raw = pd.read_csv(url)
@@ -277,257 +235,18 @@ def load_url_normalized(url: str, league_label_override: str, season_tag: str) -
 
 
 # =========================
-# Odds API (The Odds API)
-# =========================
-
-LEAGUE_TO_ODDSAPI_SPORT = {
-    "Premier League": "soccer_epl",
-    "La Liga": "soccer_spain_la_liga",
-    "Serie A": "soccer_italy_serie_a",
-    "Bundesliga": "soccer_germany_bundesliga",
-    "Ligue 1": "soccer_france_ligue_one",
-    "Brasileirão": "soccer_brazil_campeonato",
-    "Brazil Serie A": "soccer_brazil_campeonato",
-    "Campeonato Brasileiro": "soccer_brazil_campeonato",
-    "Champions League": "soccer_uefa_champs_league",
-    "UEFA Champions League": "soccer_uefa_champs_league",
-}
-
-def _strip_accents(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-
-def norm_team(s: str) -> str:
-    s0 = _strip_accents(str(s).lower()).strip()
-    s0 = re.sub(r"[\.\,\-\(\)\[\]\/\&\+]", " ", s0)
-    s0 = re.sub(r"\b(fc|sc|cf|ac|afc|cfc|cd|ud|sv|tsv|bk|fk|ec|cr|atletico|athletic)\b", " ", s0)
-    s0 = re.sub(r"\b(de|da|do|das|dos|the)\b", " ", s0)
-    s0 = re.sub(r"\s+", " ", s0).strip()
-    return s0
-
-def teams_match_score(home_a: str, away_a: str, home_b: str, away_b: str) -> float:
-    """
-    Score de match entre (A=app) e (B=api).
-    1.0 = perfeito; maior melhor.
-    """
-    ha, aa = norm_team(home_a), norm_team(away_a)
-    hb, ab = norm_team(home_b), norm_team(away_b)
-
-    # match direto
-    if ha == hb and aa == ab:
-        return 1.0
-
-    # sets iguais (pouco provável mas ajuda em inversões)
-    seta = {ha, aa}
-    setb = {hb, ab}
-    if seta == setb:
-        return 0.75
-
-    # token overlap
-    def tok(s: str) -> set:
-        return set(s.split())
-
-    inter = len(tok(ha) & tok(hb)) + len(tok(aa) & tok(ab))
-    denom = max(1, len(tok(ha)) + len(tok(hb)) + len(tok(aa)) + len(tok(ab)))
-    return inter / denom
-
-@st.cache_data(show_spinner=False, ttl=300)
-def oddsapi_list_soccer_sports(api_key: str) -> List[Dict[str, str]]:
-    url = "https://api.the-odds-api.com/v4/sports"
-    r = requests.get(url, params={"apiKey": api_key}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    soccer = []
-    for item in data:
-        if str(item.get("key", "")).startswith("soccer_"):
-            soccer.append({"key": item.get("key", ""), "title": item.get("title", "")})
-    return sorted(soccer, key=lambda x: x["title"])
-
-@st.cache_data(show_spinner=False, ttl=300)
-def oddsapi_fetch_odds(api_key: str, sport_key: str, regions: str, markets: str, odds_format: str = "decimal") -> List[dict]:
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {
-        "apiKey": api_key,
-        "regions": regions,
-        "markets": markets,
-        "oddsFormat": odds_format,
-        "dateFormat": "iso",
-    }
-    r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    return r.json()
-
-def _pick_bookmaker(books: List[dict], preference: str) -> List[dict]:
-    """
-    preference:
-      - "Best price" => usar todas para escolher melhor odd por outcome
-      - ou nome exato de bookmaker (ex.: "pinnacle", "bet365"... dependendo do catálogo)
-    """
-    if preference == "Best price":
-        return books
-    pref = preference.strip().lower()
-    chosen = [b for b in books if str(b.get("key", "")).lower() == pref or str(b.get("title", "")).lower() == pref]
-    return chosen if chosen else books
-
-def _extract_market_prices(bookmakers: List[dict], market_key: str) -> List[dict]:
-    out = []
-    for b in bookmakers:
-        for m in b.get("markets", []) or []:
-            if str(m.get("key", "")).lower() == market_key.lower():
-                out.append({"book": b, "market": m})
-    return out
-
-def oddsapi_best_price_h2h(markets_blocks: List[dict], home_name_api: str, away_name_api: str) -> Dict[str, Optional[float]]:
-    best = {"home": None, "draw": None, "away": None}
-    for blk in markets_blocks:
-        outcomes = blk["market"].get("outcomes", []) or []
-        for o in outcomes:
-            name = str(o.get("name", ""))
-            price = o.get("price", None)
-            if price is None:
-                continue
-            price = float(price)
-
-            n = norm_team(name)
-            if n == norm_team(home_name_api):
-                best["home"] = price if best["home"] is None else max(best["home"], price)
-            elif n == norm_team(away_name_api):
-                best["away"] = price if best["away"] is None else max(best["away"], price)
-            elif n == "draw":
-                best["draw"] = price if best["draw"] is None else max(best["draw"], price)
-    return best
-
-def oddsapi_best_price_totals_25(markets_blocks: List[dict]) -> Dict[str, Optional[float]]:
-    # retorna Over/Under 2.5
-    best = {"over_2_5": None, "under_2_5": None}
-    for blk in markets_blocks:
-        outcomes = blk["market"].get("outcomes", []) or []
-        for o in outcomes:
-            name = str(o.get("name", "")).lower()
-            point = o.get("point", None)
-            price = o.get("price", None)
-            if point is None or price is None:
-                continue
-            try:
-                point = float(point)
-            except Exception:
-                continue
-            if abs(point - 2.5) > 1e-9:
-                continue
-            price = float(price)
-            if "over" in name:
-                best["over_2_5"] = price if best["over_2_5"] is None else max(best["over_2_5"], price)
-            if "under" in name:
-                best["under_2_5"] = price if best["under_2_5"] is None else max(best["under_2_5"], price)
-    return best
-
-def oddsapi_best_price_btts(markets_blocks: List[dict]) -> Dict[str, Optional[float]]:
-    best = {"btts_yes": None, "btts_no": None}
-    for blk in markets_blocks:
-        outcomes = blk["market"].get("outcomes", []) or []
-        for o in outcomes:
-            name = str(o.get("name", "")).lower()
-            price = o.get("price", None)
-            if price is None:
-                continue
-            price = float(price)
-            if name in {"yes", "y"}:
-                best["btts_yes"] = price if best["btts_yes"] is None else max(best["btts_yes"], price)
-            if name in {"no", "n"}:
-                best["btts_no"] = price if best["btts_no"] is None else max(best["btts_no"], price)
-    return best
-
-def oddsapi_get_odds_for_fixture(
-    api_key: str,
-    sport_key: str,
-    regions: str,
-    bookmaker_pref: str,
-    home_team_app: str,
-    away_team_app: str,
-) -> Dict[str, Optional[float]]:
-    """
-    Busca odds 1X2, O/U 2.5, BTTS para o jogo mais próximo por nomes.
-    Retorna dict com chaves:
-      home_win, draw, away_win, over_2_5, under_2_5, btts_yes, btts_no
-    """
-    markets = "h2h,totals,btts"
-    events = oddsapi_fetch_odds(api_key, sport_key=sport_key, regions=regions, markets=markets)
-
-    if not isinstance(events, list) or len(events) == 0:
-        return {k: None for k in ["home_win","draw","away_win","over_2_5","under_2_5","btts_yes","btts_no"]}
-
-    # achar melhor match por times
-    best_event = None
-    best_score = -1.0
-    for ev in events:
-        h_api = ev.get("home_team", "")
-        a_api = ev.get("away_team", "")
-        sc = teams_match_score(home_team_app, away_team_app, h_api, a_api)
-        if sc > best_score:
-            best_score = sc
-            best_event = ev
-
-    if best_event is None or best_score < 0.25:
-        return {k: None for k in ["home_win","draw","away_win","over_2_5","under_2_5","btts_yes","btts_no"]}
-
-    books = best_event.get("bookmakers", []) or []
-    books = _pick_bookmaker(books, bookmaker_pref)
-
-    # h2h
-    h2h_blocks = _extract_market_prices(books, "h2h")
-    best_h2h = oddsapi_best_price_h2h(h2h_blocks, best_event.get("home_team",""), best_event.get("away_team",""))
-
-    # totals
-    totals_blocks = _extract_market_prices(books, "totals")
-    best_tot = oddsapi_best_price_totals_25(totals_blocks)
-
-    # btts
-    btts_blocks = _extract_market_prices(books, "btts")
-    best_btts = oddsapi_best_price_btts(btts_blocks)
-
-    return {
-        "home_win": best_h2h["home"],
-        "draw": best_h2h["draw"],
-        "away_win": best_h2h["away"],
-        "over_2_5": best_tot["over_2_5"],
-        "under_2_5": best_tot["under_2_5"],
-        "btts_yes": best_btts["btts_yes"],
-        "btts_no": best_btts["btts_no"],
-    }
-
-def oddsapi_available_bookmakers(events: List[dict]) -> List[str]:
-    keys = set()
-    titles = set()
-    for ev in events or []:
-        for b in (ev.get("bookmakers") or []):
-            if b.get("key"):
-                keys.add(str(b.get("key")).lower())
-            if b.get("title"):
-                titles.add(str(b.get("title")).lower())
-    out = sorted(keys.union(titles))
-    return out
-
-
-
-# =========================
-# Elo dinâmico (Upgrade 1) — ELO_DINAMICO_V1
+# Elo dinâmico (Upgrade 1)
 # =========================
 
 def _elo_expected_score(r_home: float, r_away: float, hfa: float) -> float:
-    """
-    Expectativa do mandante (0-1) considerando Home Field Advantage (hfa em pontos Elo).
-    """
     return 1.0 / (1.0 + 10 ** (((r_away) - (r_home + hfa)) / 400.0))
 
+
 def _elo_mov_multiplier(goal_diff: int, elo_diff: float) -> float:
-    """
-    Multiplicador por margem de vitória (heurística comum).
-    goal_diff: |HG-AG|
-    elo_diff: (R_home+HFA) - R_away
-    """
     if goal_diff <= 1:
         return 1.0
-    # fórmula inspirada em variações clássicas de Elo no futebol
     return (math.log(goal_diff + 1.0) * (2.2 / ((elo_diff * 0.001) + 2.2)))
+
 
 @st.cache_data(show_spinner=False)
 def add_dynamic_elo_columns(
@@ -538,29 +257,16 @@ def add_dynamic_elo_columns(
     use_mov: bool = True,
     per_league: bool = True,
 ) -> pd.DataFrame:
-    """
-    Preenche home_elo e away_elo PRE-MATCH, calculando Elo jogo-a-jogo no histórico.
-
-    - base_elo: Elo inicial por time
-    - k: fator de atualização (quanto maior, mais reage)
-    - hfa: vantagem de casa em pontos Elo
-    - use_mov: aplica multiplicador por margem de vitória
-    - per_league: Elo separado por liga (recomendado)
-    """
     df = matches.copy()
-    if "date_dt" not in df.columns:
-        raise ValueError("date_dt não encontrado; normalize_matches_dataframe deveria criar essa coluna.")
-
     df = df.sort_values(["date_dt", "league", "home_team", "away_team"]).reset_index(drop=True)
 
-    # rating store
-    ratings: dict = {}  # key -> rating
+    ratings: Dict[str, float] = {}
 
     def key_for(league: str, team: str) -> str:
         return f"{league}||{team}" if per_league else team
 
-    home_elos = []
-    away_elos = []
+    home_elos: List[float] = []
+    away_elos: List[float] = []
 
     for _, r in df.iterrows():
         league = str(r["league"])
@@ -573,13 +279,13 @@ def add_dynamic_elo_columns(
         r_home = float(ratings.get(kh, base_elo))
         r_away = float(ratings.get(ka, base_elo))
 
-        # Elo pré-jogo (o que interessa para features/modelo)
+        # pré-jogo
         home_elos.append(r_home)
         away_elos.append(r_away)
 
-        # resultado
         hg = int(r["home_goals"])
         ag = int(r["away_goals"])
+
         if hg > ag:
             s_home = 1.0
         elif hg == ag:
@@ -606,6 +312,7 @@ def add_dynamic_elo_columns(
     df["away_elo"] = away_elos
     return df
 
+
 # =========================
 # Forma / stats com ponderação
 # =========================
@@ -623,12 +330,14 @@ class TeamForm:
     points_per_game: float
     elo: float
 
+
 def _points_from_score(gf: int, ga: int) -> int:
     if gf > ga:
         return 3
     if gf == ga:
         return 1
     return 0
+
 
 def _wavg(values: List[float], weights: List[float], fallback: float) -> float:
     if len(values) == 0:
@@ -639,11 +348,12 @@ def _wavg(values: List[float], weights: List[float], fallback: float) -> float:
         return float(np.mean(v))
     return float(np.average(v, weights=w))
 
+
 def compute_team_form(matches: pd.DataFrame, team: str, n_last: int, weights_by_season: Dict[str, float]) -> TeamForm:
     mask = (matches["home_team"] == team) | (matches["away_team"] == team)
     tm = matches.loc[mask].copy()
     if tm.empty:
-        return TeamForm(team, 0, 1.0, 1.0, 1.1, 1.0, 0.9, 1.1, 1.0, 1600.0)
+        return TeamForm(team, 0, 1.0, 1.0, 1.1, 1.0, 0.9, 1.1, 1.0, 1500.0)
 
     tm = tm.sort_values("date_dt").tail(n_last)
 
@@ -659,14 +369,13 @@ def compute_team_form(matches: pd.DataFrame, team: str, n_last: int, weights_by_
         if r["home_team"] == team:
             gf, ga = int(r["home_goals"]), int(r["away_goals"])
             gf_home.append(gf); ga_home.append(ga); w_home.append(w)
-            elo_values.append(float(r.get("home_elo", 1600.0))); elo_w.append(w)
+            elo_values.append(float(r.get("home_elo", 1500.0))); elo_w.append(w)
         else:
             gf, ga = int(r["away_goals"]), int(r["home_goals"])
             gf_away.append(gf); ga_away.append(ga); w_away.append(w)
-            elo_values.append(float(r.get("away_elo", 1600.0))); elo_w.append(w)
+            elo_values.append(float(r.get("away_elo", 1500.0))); elo_w.append(w)
 
-        gf_list.append(gf)
-        ga_list.append(ga)
+        gf_list.append(gf); ga_list.append(ga)
         pts_list.append(_points_from_score(gf, ga))
         w_list.append(w)
 
@@ -680,8 +389,9 @@ def compute_team_form(matches: pd.DataFrame, team: str, n_last: int, weights_by_
         gf_away_avg=_wavg(gf_away, w_away, 0.9),
         ga_away_avg=_wavg(ga_away, w_away, 1.1),
         points_per_game=_wavg(pts_list, w_list, 1.0),
-        elo=_wavg(elo_values, elo_w, 1600.0),
+        elo=_wavg(elo_values, elo_w, 1500.0),
     )
+
 
 def league_goal_averages(matches: pd.DataFrame, league: str, weights_by_season: Dict[str, float]) -> Dict[str, float]:
     df = matches[matches["league"] == league].copy()
@@ -703,59 +413,8 @@ def league_goal_averages(matches: pd.DataFrame, league: str, weights_by_season: 
 
 
 # =========================
-# Poisson
+# Poisson + Dixon–Coles
 # =========================
-
-# =========================
-# Dixon–Coles (Upgrade 2) — DIXON_COLES_V1
-# =========================
-
-def dixon_coles_tau(hg: int, ag: int, lam_h: float, lam_a: float, rho: float) -> float:
-    """
-    Fator de correção τ(hg,ag) de Dixon–Coles para low-scores.
-    Fórmulas clássicas:
-      τ00 = 1 - (λh*λa*rho)
-      τ01 = 1 + (λh*rho)
-      τ10 = 1 + (λa*rho)
-      τ11 = 1 - rho
-    Para outros placares, τ = 1.
-    """
-    if hg == 0 and ag == 0:
-        return 1.0 - (lam_h * lam_a * rho)
-    if hg == 0 and ag == 1:
-        return 1.0 + (lam_h * rho)
-    if hg == 1 and ag == 0:
-        return 1.0 + (lam_a * rho)
-    if hg == 1 and ag == 1:
-        return 1.0 - rho
-    return 1.0
-
-def score_matrix_dixon_coles(lambda_home: float, lambda_away: float, max_goals: int, rho: float) -> pd.DataFrame:
-    """
-    Matriz de placares usando Poisson * τ (Dixon–Coles) nos low-scores.
-    Observação: como truncamos em 0..max_goals, normalizamos a soma para 1.
-    """
-    hs = np.arange(0, max_goals + 1)
-    as_ = np.arange(0, max_goals + 1)
-
-    p_home = poisson.pmf(hs, mu=lambda_home)
-    p_away = poisson.pmf(as_, mu=lambda_away)
-
-    mat = np.outer(p_home, p_away)
-
-    # aplica τ nos low scores (0/1)
-    for hg in [0, 1]:
-        for ag in [0, 1]:
-            if hg <= max_goals and ag <= max_goals:
-                mat[hg, ag] = mat[hg, ag] * dixon_coles_tau(hg, ag, lambda_home, lambda_away, rho)
-
-    # normaliza (por truncamento)
-    s = float(mat.sum())
-    if s > 0:
-        mat = mat / s
-
-    return pd.DataFrame(mat, index=hs, columns=as_)
-
 
 def estimate_expected_goals_poisson(
     matches: pd.DataFrame,
@@ -805,9 +464,10 @@ def estimate_expected_goals_poisson(
         "form_home": float(form_home),
         "form_away": float(form_away),
         "elo_diff_scaled": float(elo_diff),
-        "weights_by_season": weights_by_season,
+        "weights_by_season": dict(weights_by_season),
     }
     return lam_home, lam_away, dbg
+
 
 def score_matrix_poisson(lambda_home: float, lambda_away: float, max_goals: int) -> pd.DataFrame:
     hs = np.arange(0, max_goals + 1)
@@ -815,10 +475,46 @@ def score_matrix_poisson(lambda_home: float, lambda_away: float, max_goals: int)
     p_home = poisson.pmf(hs, mu=lambda_home)
     p_away = poisson.pmf(as_, mu=lambda_away)
     mat = np.outer(p_home, p_away)
+    s = float(mat.sum())
+    if s > 0:
+        mat = mat / s
     return pd.DataFrame(mat, index=hs, columns=as_)
 
+
+def dixon_coles_tau(hg: int, ag: int, lam_h: float, lam_a: float, rho: float) -> float:
+    if hg == 0 and ag == 0:
+        return 1.0 - (lam_h * lam_a * rho)
+    if hg == 0 and ag == 1:
+        return 1.0 + (lam_h * rho)
+    if hg == 1 and ag == 0:
+        return 1.0 + (lam_a * rho)
+    if hg == 1 and ag == 1:
+        return 1.0 - rho
+    return 1.0
+
+
+def score_matrix_dixon_coles(lambda_home: float, lambda_away: float, max_goals: int, rho: float) -> pd.DataFrame:
+    hs = np.arange(0, max_goals + 1)
+    as_ = np.arange(0, max_goals + 1)
+    p_home = poisson.pmf(hs, mu=lambda_home)
+    p_away = poisson.pmf(as_, mu=lambda_away)
+    mat = np.outer(p_home, p_away)
+
+    # Ajuste apenas nos low scores
+    for hg in [0, 1]:
+        for ag in [0, 1]:
+            if hg <= max_goals and ag <= max_goals:
+                mat[hg, ag] = mat[hg, ag] * dixon_coles_tau(hg, ag, lambda_home, lambda_away, rho)
+
+    s = float(mat.sum())
+    if s > 0:
+        mat = mat / s
+
+    return pd.DataFrame(mat, index=hs, columns=as_)
+
+
 def list_top_bottom_scores(mat: pd.DataFrame, k: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    flat = []
+    flat: List[Tuple[int, int, float]] = []
     for hg in mat.index:
         for ag in mat.columns:
             flat.append((int(hg), int(ag), float(mat.loc[hg, ag])))
@@ -826,9 +522,10 @@ def list_top_bottom_scores(mat: pd.DataFrame, k: int = 5) -> Tuple[pd.DataFrame,
     top = sorted(flat, key=lambda x: x[2], reverse=True)[:k]
     bottom = sorted(flat, key=lambda x: x[2])[:k]
 
-    top_df = pd.DataFrame([{"placar": f"{hg}x{ag}", "prob": p, "prob_%": 100.0*p} for hg, ag, p in top])
-    bot_df = pd.DataFrame([{"placar": f"{hg}x{ag}", "prob": p, "prob_%": 100.0*p} for hg, ag, p in bottom])
+    top_df = pd.DataFrame([{"placar": f"{hg}x{ag}", "prob": p, "prob_%": 100.0 * p} for hg, ag, p in top])
+    bot_df = pd.DataFrame([{"placar": f"{hg}x{ag}", "prob": p, "prob_%": 100.0 * p} for hg, ag, p in bottom])
     return top_df, bot_df
+
 
 def probs_1x2_over_btts(mat: pd.DataFrame) -> Dict[str, float]:
     p_home = p_draw = p_away = 0.0
@@ -861,8 +558,26 @@ def probs_1x2_over_btts(mat: pd.DataFrame) -> Dict[str, float]:
     }
 
 
+def heatmap_figure(mat: pd.DataFrame, title: str) -> plt.Figure:
+    fig, ax = plt.subplots()
+    im = ax.imshow(mat.values, aspect="auto")
+    ax.set_title(title)
+    ax.set_xlabel("Gols Visitante")
+    ax.set_ylabel("Gols Mandante")
+    ax.set_xticks(range(len(mat.columns)))
+    ax.set_yticks(range(len(mat.index)))
+    ax.set_xticklabels(mat.columns)
+    ax.set_yticklabels(mat.index)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    return fig
+
+
+def pct(x: float) -> float:
+    return 100.0 * float(x)
+
+
 # =========================
-# ML (RandomForest) — estável
+# ML (RandomForest) — opcional
 # =========================
 
 def build_ml_dataset(matches: pd.DataFrame, n_last: int, weights_by_season: Dict[str, float]) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
@@ -909,6 +624,7 @@ def build_ml_dataset(matches: pd.DataFrame, n_last: int, weights_by_season: Dict
     y_away = df["y_away_goals"]
     return X, y_home, y_away
 
+
 @st.cache_resource(show_spinner=False)
 def train_ml_models_cached(matches: pd.DataFrame, n_last: int, weights_by_season: Dict[str, float], random_state: int = 42) -> Dict[str, object]:
     X, y_h, y_a = build_ml_dataset(matches, n_last=n_last, weights_by_season=weights_by_season)
@@ -942,6 +658,7 @@ def train_ml_models_cached(matches: pd.DataFrame, n_last: int, weights_by_season
         "feature_columns": list(X.columns),
         "n_rows": int(len(X)),
     }
+
 
 def predict_expected_goals_ml(matches: pd.DataFrame, league: str, home_team: str, away_team: str, trained: Dict[str, object],
                               n_last: int, weights_by_season: Dict[str, float]) -> Tuple[float, float, Dict[str, float]]:
@@ -990,7 +707,7 @@ def predict_expected_goals_ml(matches: pd.DataFrame, league: str, home_team: str
 
 
 # =========================
-# Confiança + Alertas + Recomendação + Texto
+# Confiança + recomendação + EV
 # =========================
 
 MARKET_LABELS = {
@@ -1003,12 +720,14 @@ MARKET_LABELS = {
     "btts_no": "BTTS Não",
 }
 
+
 def confidence_score_from_models(probsP: Dict[str, float], probsM: Dict[str, float]) -> Tuple[int, Dict[str, float]]:
     main_keys = ["home_win", "draw", "away_win", "over_2_5", "btts_yes"]
     diffs_pp_all = {k: abs(probsP[k] - probsM[k]) * 100.0 for k in MARKET_LABELS.keys()}
     avg_diff = float(np.mean([diffs_pp_all[k] for k in main_keys]))
     score = int(np.clip(100 - (avg_diff * 2.0), 0, 100))
     return score, diffs_pp_all
+
 
 def confidence_label(score: int) -> str:
     if score >= 80:
@@ -1017,6 +736,7 @@ def confidence_label(score: int) -> str:
         return "Média"
     return "Baixa"
 
+
 def market_level(diff_pp: float) -> str:
     if diff_pp <= 8.0:
         return "verde"
@@ -1024,22 +744,6 @@ def market_level(diff_pp: float) -> str:
         return "amarelo"
     return "vermelho"
 
-def lambda_extremes(lh: float, la: float) -> Tuple[bool, List[str]]:
-    msgs = []
-    extreme = False
-    if lh >= 3.50:
-        extreme = True
-        msgs.append(f"λ mandante muito alto ({lh:.2f}) → risco de superestimar goleada.")
-    if la >= 3.50:
-        extreme = True
-        msgs.append(f"λ visitante muito alto ({la:.2f}) → risco de superestimar goleada.")
-    if lh <= 0.30:
-        extreme = True
-        msgs.append(f"λ mandante muito baixo ({lh:.2f}) → risco de subestimar gols do mandante.")
-    if la <= 0.30:
-        extreme = True
-        msgs.append(f"λ visitante muito baixo ({la:.2f}) → risco de subestimar gols do visitante.")
-    return extreme, msgs
 
 def risk_profile_params(profile: str) -> Dict[str, object]:
     if profile == "Conservador":
@@ -1047,6 +751,7 @@ def risk_profile_params(profile: str) -> Dict[str, object]:
     if profile == "Agressivo":
         return {"allowed": set(MARKET_LABELS.keys()), "w_diff": 2.2, "w_prob": 0.9, "min_prob": 0.40}
     return {"allowed": set(MARKET_LABELS.keys()), "w_diff": 2.0, "w_prob": 1.2, "min_prob": 0.50}
+
 
 def recommended_markets(probsP: Dict[str, float], probsM: Dict[str, float], diffs_pp: Dict[str, float], profile: str) -> List[Dict[str, object]]:
     params = risk_profile_params(profile)
@@ -1062,7 +767,6 @@ def recommended_markets(probsP: Dict[str, float], probsM: Dict[str, float], diff
         p_avg = 0.5 * (probsP[k] + probsM[k])
         diff = float(diffs_pp[k])
         lvl = market_level(diff)
-
         prob_penalty = 0.0
         if p_avg < min_prob:
             prob_penalty = (min_prob - p_avg) * 100.0
@@ -1074,111 +778,204 @@ def recommended_markets(probsP: Dict[str, float], probsM: Dict[str, float], diff
 
     return sorted(items, key=lambda x: x["rank_score"])[:3]
 
-def auto_analysis_text(
-    league: str,
-    home_team: str,
-    away_team: str,
-    probsP: Dict[str, float],
-    probsM: Dict[str, float],
-    diffs_pp: Dict[str, float],
-    score: int,
-    label: str,
-    lam_h: float,
-    lam_a: float,
-    lam_h_ml: float,
-    lam_a_ml: float,
-    recs: List[Dict[str, object]],
-    risk_profile: str,
-    extremes_msgs: List[str],
-) -> str:
-    avg_1 = 0.5 * (probsP["home_win"] + probsM["home_win"])
-    avg_x = 0.5 * (probsP["draw"] + probsM["draw"])
-    avg_2 = 0.5 * (probsP["away_win"] + probsM["away_win"])
-    fav = "Mandante" if avg_1 >= max(avg_x, avg_2) else ("Visitante" if avg_2 >= max(avg_1, avg_x) else "Empate")
-    fav_pct = max(avg_1, avg_x, avg_2) * 100.0
 
-    over_avg = 0.5 * (probsP["over_2_5"] + probsM["over_2_5"]) * 100.0
-    btts_avg = 0.5 * (probsP["btts_yes"] + probsM["btts_yes"]) * 100.0
-
-    worst = sorted([(MARKET_LABELS[k], diffs_pp[k]) for k in ["home_win","draw","away_win","btts_yes","over_2_5"]], key=lambda x: x[1], reverse=True)[:2]
-    w1, w2 = worst[0], worst[1]
-
-    top1 = recs[0]
-    alt = [r["mercado"] for r in recs[1:]]
-
-    texto = []
-    texto.append(f"**{home_team} x {away_team} ({league})**")
-    texto.append(f"- **Perfil de risco:** **{risk_profile}** (isso muda o ranking de recomendações).")
-    texto.append(f"- **Confiança:** {score}/100 (**{label}**) — quanto mais alta, mais Poisson e ML concordam.")
-    texto.append(f"- **Gols esperados (Poisson):** {lam_h:.2f} x {lam_a:.2f} | **Gols esperados (ML):** {lam_h_ml:.2f} x {lam_a_ml:.2f}")
-    texto.append(f"- **Tendência de resultado:** leve viés para **{fav}** (~{fav_pct:.1f}%).")
-    texto.append(f"- **Tendência de gols:** Over 2.5 ~**{over_avg:.1f}%** | BTTS (Sim) ~**{btts_avg:.1f}%** (médias Poisson+ML).")
-
-    if extremes_msgs:
-        texto.append("")
-        texto.append("**⚠️ Alerta de extremos (λ):**")
-        for m in extremes_msgs:
-            texto.append(f"- {m}")
-        texto.append("Sugestão: aumente o histórico (2 temporadas) e/ou use perfil Conservador para recomendações.")
-
-    texto.append("")
-    texto.append("**✅ Mercado recomendado (pela consistência entre modelos + perfil de risco):**")
-    texto.append(f"- **{top1['mercado']}** — divergência **{top1['diff_pp']:.2f} p.p.**, prob. média **{top1['prob_avg']*100:.1f}%** ({top1['nivel']}).")
-    if alt:
-        texto.append(f"- Alternativas: {', '.join(alt)}")
-
-    texto.append("")
-    texto.append("**⚠️ Pontos de atenção (onde os modelos mais discordam):**")
-    texto.append(f"- {w1[0]}: **{w1[1]:.2f} p.p.**")
-    texto.append(f"- {w2[0]}: **{w2[1]:.2f} p.p.**")
-    texto.append("")
-    texto.append("**Leitura rápida:** divergência alta em 1X2/BTTS = evite esses mercados e priorize os mercados com alerta verde.")
-    return "\n".join(texto)
-
-
-# =========================
-# EV (Valor Esperado)
-# =========================
-
-def fair_odds(p: float) -> Optional[float]:
-    if p <= 0:
+def ev_from_odds(p: float, odds: float) -> Optional[float]:
+    if not (np.isfinite(odds) and odds > 1e-9):
         return None
-    return 1.0 / p
-
-def expected_value(p: float, odd: float) -> float:
-    return (p * odd) - 1.0
-
-def clamp_prob(p: float) -> float:
-    return float(np.clip(p, 1e-9, 1.0 - 1e-9))
+    return float(p) * float(odds) - 1.0
 
 
 # =========================
-# Plot helper
+# Upgrade 3 — Backtest + Calibração
 # =========================
 
-def heatmap_figure(mat: pd.DataFrame, title: str) -> plt.Figure:
+def _outcome_1x2(hg: int, ag: int) -> str:
+    if hg > ag:
+        return "H"
+    if hg == ag:
+        return "D"
+    return "A"
+
+
+def _brier_multiclass(pH: float, pD: float, pA: float, y: str) -> float:
+    oH = 1.0 if y == "H" else 0.0
+    oD = 1.0 if y == "D" else 0.0
+    oA = 1.0 if y == "A" else 0.0
+    return ((pH - oH) ** 2 + (pD - oD) ** 2 + (pA - oA) ** 2) / 3.0
+
+
+def _logloss_1x2(pH: float, pD: float, pA: float, y: str, eps: float = 1e-12) -> float:
+    if y == "H":
+        p = max(pH, eps)
+    elif y == "D":
+        p = max(pD, eps)
+    else:
+        p = max(pA, eps)
+    return -float(np.log(p))
+
+
+def _brier_binary(p: float, y: int) -> float:
+    return (float(p) - float(y)) ** 2
+
+
+def _logloss_binary(p: float, y: int, eps: float = 1e-12) -> float:
+    p = float(np.clip(p, eps, 1.0 - eps))
+    return - (y * np.log(p) + (1 - y) * np.log(1 - p))
+
+
+def _pick_matrix(lh: float, la: float, max_goals: int, use_dc: bool, rho: float) -> pd.DataFrame:
+    if use_dc:
+        return score_matrix_dixon_coles(lh, la, max_goals=max_goals, rho=rho)
+    return score_matrix_poisson(lh, la, max_goals=max_goals)
+
+
+@st.cache_data(show_spinner=False)
+def run_rolling_backtest(
+    matches: pd.DataFrame,
+    league: str,
+    n_last: int,
+    max_goals: int,
+    weights_by_season: Dict[str, float],
+    use_dc: bool,
+    rho: float,
+    home_advantage: float,
+    elo_k: float,
+    min_hist_matches: int = 120,
+    test_last_n: int = 250,
+) -> pd.DataFrame:
+    df = matches[matches["league"] == league].copy()
+    df = df.sort_values("date_dt").reset_index(drop=True)
+    if len(df) < (min_hist_matches + 20):
+        raise ValueError(f"Poucos jogos na liga para backtest: {len(df)} (mínimo recomendado: {min_hist_matches + 20}).")
+
+    start_idx = max(min_hist_matches, len(df) - test_last_n)
+    rows = []
+
+    for i in range(start_idx, len(df)):
+        r = df.iloc[i]
+        hist = df.iloc[:i].copy()
+
+        home = str(r["home_team"])
+        away = str(r["away_team"])
+
+        lh, la, _ = estimate_expected_goals_poisson(
+            matches=hist,
+            league=league,
+            home_team=home,
+            away_team=away,
+            n_last=n_last,
+            weights_by_season=weights_by_season,
+            home_advantage=home_advantage,
+            elo_k=elo_k,
+        )
+
+        mat = _pick_matrix(lh, la, max_goals=max_goals, use_dc=use_dc, rho=rho)
+        probs = probs_1x2_over_btts(mat)
+
+        hg = int(r["home_goals"])
+        ag = int(r["away_goals"])
+        y_1x2 = _outcome_1x2(hg, ag)
+        y_over25 = 1 if (hg + ag) >= 3 else 0
+        y_btts = 1 if (hg >= 1 and ag >= 1) else 0
+
+        rows.append({
+            "date": str(r["date"]),
+            "home": home,
+            "away": away,
+            "hg": hg,
+            "ag": ag,
+            "y_1x2": y_1x2,
+            "y_over25": y_over25,
+            "y_btts": y_btts,
+            "p_home": float(probs["home_win"]),
+            "p_draw": float(probs["draw"]),
+            "p_away": float(probs["away_win"]),
+            "p_over25": float(probs["over_2_5"]),
+            "p_btts": float(probs["btts_yes"]),
+            "home_odds": float(r.get("home_odds")) if pd.notna(r.get("home_odds")) else np.nan,
+            "draw_odds": float(r.get("draw_odds")) if pd.notna(r.get("draw_odds")) else np.nan,
+            "away_odds": float(r.get("away_odds")) if pd.notna(r.get("away_odds")) else np.nan,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def backtest_metrics(df_bt: pd.DataFrame) -> Dict[str, float]:
+    if df_bt.empty:
+        raise ValueError("Backtest vazio.")
+
+    brier_1x2 = float(np.mean([
+        _brier_multiclass(r.p_home, r.p_draw, r.p_away, r.y_1x2) for r in df_bt.itertuples(index=False)
+    ]))
+    ll_1x2 = float(np.mean([
+        _logloss_1x2(r.p_home, r.p_draw, r.p_away, r.y_1x2) for r in df_bt.itertuples(index=False)
+    ]))
+
+    brier_over = float(np.mean([_brier_binary(r.p_over25, int(r.y_over25)) for r in df_bt.itertuples(index=False)]))
+    ll_over = float(np.mean([_logloss_binary(r.p_over25, int(r.y_over25)) for r in df_bt.itertuples(index=False)]))
+
+    brier_btts = float(np.mean([_brier_binary(r.p_btts, int(r.y_btts)) for r in df_bt.itertuples(index=False)]))
+    ll_btts = float(np.mean([_logloss_binary(r.p_btts, int(r.y_btts)) for r in df_bt.itertuples(index=False)]))
+
+    return {
+        "brier_1x2": brier_1x2,
+        "logloss_1x2": ll_1x2,
+        "brier_over25": brier_over,
+        "logloss_over25": ll_over,
+        "brier_btts": brier_btts,
+        "logloss_btts": ll_btts,
+        "n_test": float(len(df_bt)),
+    }
+
+
+def roi_evplus_1x2(df_bt: pd.DataFrame, ev_threshold: float = 0.02, min_prob: float = 0.0) -> Dict[str, float]:
+    bets = 0
+    profit = 0.0
+
+    for r in df_bt.itertuples(index=False):
+        odds = {"H": r.home_odds, "D": r.draw_odds, "A": r.away_odds}
+        probs = {"H": r.p_home, "D": r.p_draw, "A": r.p_away}
+
+        if not (np.isfinite(odds["H"]) and np.isfinite(odds["D"]) and np.isfinite(odds["A"])):
+            continue
+
+        evs = {k: probs[k] * odds[k] - 1.0 for k in ["H", "D", "A"]}
+        pick = max(evs, key=lambda k: evs[k])
+
+        if evs[pick] <= ev_threshold:
+            continue
+        if probs[pick] < min_prob:
+            continue
+
+        bets += 1
+        if r.y_1x2 == pick:
+            profit += (odds[pick] - 1.0)
+        else:
+            profit -= 1.0
+
+    roi = profit / bets if bets > 0 else 0.0
+    return {"bets": float(bets), "profit": float(profit), "roi": float(roi)}
+
+
+def plot_reliability(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10, title: str = "Reliability") -> plt.Figure:
+    frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=n_bins, strategy="uniform")
     fig, ax = plt.subplots()
-    im = ax.imshow(mat.values, aspect="auto")
+    ax.plot(mean_pred, frac_pos, marker="o")
+    ax.plot([0, 1], [0, 1], linestyle="--")
+    ax.set_xlabel("Probabilidade prevista (bin)")
+    ax.set_ylabel("Frequência observada")
     ax.set_title(title)
-    ax.set_xlabel("Gols Visitante")
-    ax.set_ylabel("Gols Mandante")
-    ax.set_xticks(range(len(mat.columns)))
-    ax.set_yticks(range(len(mat.index)))
-    ax.set_xticklabels(mat.columns)
-    ax.set_yticklabels(mat.index)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
     return fig
 
-def pct(x: float) -> float:
-    return 100.0 * float(x)
-
 
 # =========================
-# Sidebar — Fonte + Presets + Modelo + Perfil de risco + Odds
+# Sidebar
 # =========================
 
 with st.sidebar:
-    st.header("Presets (4 modelos)")
+    st.header("Presets")
     preset_name = st.selectbox("Escolha um preset", list(PRESETS.keys()), index=0, key="preset_name")
     st.caption(PRESETS[preset_name]["desc"])
     if st.button("Aplicar preset agora"):
@@ -1187,237 +984,165 @@ with st.sidebar:
 
     st.divider()
     st.header("Fonte de dados")
-    source = st.radio("Escolha a fonte", ["URL (1 ou 2 temporadas)", "Dataset fictício"], index=0)
 
-    url1 = ""
-    url2 = ""
-    league_override = ""
-
-    if source == "URL (1 ou 2 temporadas)":
-        st.caption("URL 1 = CURRENT. URL 2 = PREV (opcional).")
-        url1 = st.text_input("URL CSV (Temporada atual)", value="https://www.football-data.co.uk/mmz4281/2526/E0.csv")
-        url2 = st.text_input("URL CSV (Temporada anterior - opcional)", value="https://www.football-data.co.uk/mmz4281/2425/E0.csv")
-        league_override = st.text_input("Opcional: nome da liga (override)", value="")
+    url1 = st.text_input("URL CSV (Temporada atual)", value=st.session_state.get("url1", "https://www.football-data.co.uk/mmz4281/2526/E0.csv"))
+    url2 = st.text_input("URL CSV (Temporada anterior - opcional)", value=st.session_state.get("url2", "https://www.football-data.co.uk/mmz4281/2425/E0.csv"))
+    league_override = st.text_input("Opcional: nome da liga (override)", value=st.session_state.get("league_override", ""))
 
     st.divider()
     st.header("Modelo")
 
-    use_recency = st.checkbox(
-        "Usar ponderação por recência entre temporadas",
-        value=st.session_state.get("use_recency", True),
-        key="use_recency"
-    )
+    use_recency = st.checkbox("Usar ponderação por recência entre temporadas",
+                             value=bool(st.session_state.get("use_recency", True)),
+                             key="use_recency")
 
-    w_current = st.slider(
-        "Peso temporada atual (%)",
-        50, 95,
-        value=int(st.session_state.get("w_current", 70)),
-        step=1,
-        disabled=not use_recency,
-        key="w_current"
-    )
+    w_current = st.slider("Peso temporada atual (%)", 50, 95,
+                          value=int(st.session_state.get("w_current", 70)),
+                          step=1, disabled=not use_recency, key="w_current")
     st.caption(f"Peso anterior = {100 - int(w_current)}%")
 
-    n_last = st.slider(
-        "Últimos N jogos (forma)",
-        5, 10,
-        value=int(st.session_state.get("n_last", 8)),
-        key="n_last"
-    )
+    n_last = st.slider("Últimos N jogos (forma)", 5, 10,
+                       value=int(st.session_state.get("n_last", 8)),
+                       key="n_last")
 
-    max_goals = st.slider(
-        "Máximo de gols na matriz",
-        3, 7,
-        value=int(st.session_state.get("max_goals", 5)),
-        key="max_goals"
-    )
+    max_goals = st.slider("Máximo de gols na matriz", 3, 7,
+                          value=int(st.session_state.get("max_goals", 5)),
+                          key="max_goals")
 
     st.divider()
     st.subheader("Poisson avançado (Dixon–Coles)")
     use_dc = st.checkbox(
-        "Ativar Dixon–Coles (corrige placares baixos / empates)",
+        "Ativar Dixon–Coles",
         value=bool(st.session_state.get("use_dc", True)),
         key="use_dc",
-        help="Ajusta 0-0, 1-0, 0-1, 1-1 via parâmetro ρ. Bom para ligas com jogos truncados/unders."
+        help="Corrige o Poisson para placares baixos (0–0, 1–0, 0–1, 1–1) via parâmetro ρ."
     )
 
     dc_rho = st.slider(
-        "ρ (rho) — intensidade do ajuste low-score",
+        "ρ (rho) — ajuste low-score",
         -0.25, 0.25,
         value=float(st.session_state.get("dc_rho", -0.06)),
         step=0.01,
         disabled=not use_dc,
         key="dc_rho",
-        help="Valores típicos ficam levemente negativos (ex.: -0.10 a -0.02). Se exagerar, distorce empates/unders."
+        help="Use valores levemente negativos (ex.: -0.10 a -0.02). Valores extremos podem distorcer empates/unders."
     )
 
-
-    use_ml = st.checkbox(
-        "Comparar com ML (RandomForest)",
-        value=bool(st.session_state.get("use_ml", False)),
-        key="use_ml"
+    auto_rho = st.checkbox(
+        "Usar preset de ρ por liga (auto)",
+        value=bool(st.session_state.get("auto_rho", True)),
+        key="auto_rho",
+        disabled=not use_dc,
+        help="Sugere um ρ padrão por liga. Você ainda pode ajustar no slider."
     )
-
-    st.divider()
-    st.header("Recomendação")
-    risk_profile = st.selectbox(
-        "Perfil de risco",
-        ["Conservador", "Equilibrado", "Agressivo"],
-        index=1,
-        help="Controla o ranking do 'mercado recomendado'. Conservador evita 1X2 e prioriza probabilidade mais alta."
-    )
-
-    st.divider()
-    st.header("Odds (The Odds API)")
-    odds_source = st.radio("Fonte de odds", ["Manual", "The Odds API"], index=1, horizontal=True)
-
-    odds_api_key = st.text_input(
-        "API Key (não publique em repo)",
-        value=st.session_state.get("odds_api_key", ""),
-        type="password",
-        help="Dica: no Streamlit Cloud use Secrets para guardar a chave."
-    )
-    st.session_state["odds_api_key"] = odds_api_key
-
-    odds_region = "eu"  # fixo conforme seu pedido
-
-    auto_sport_guess = "soccer_epl"
-    # vamos escolher um default mais provável; depois do filtro de liga, o app ajusta
-    sport_key_override = st.text_input(
-        "Sport key (opcional)",
-        value=st.session_state.get("sport_key_override", ""),
-        help="Se vazio, tenta mapear pela liga (EPL, LaLiga, etc.)."
-    )
-    st.session_state["sport_key_override"] = sport_key_override
-
-    bookmaker_pref = st.text_input(
-        "Bookmaker (opcional)",
-        value=st.session_state.get("bookmaker_pref", "Best price"),
-        help="Use 'Best price' para pegar o melhor preço entre bookmakers, ou digite o nome/slug (ex.: pinnacle, bet365 se existir na API/region)."
-    )
-    st.session_state["bookmaker_pref"] = bookmaker_pref
 
     st.divider()
     st.header("Elo dinâmico (Upgrade 1)")
     use_dynamic_elo = st.checkbox(
         "Ativar Elo dinâmico (jogo-a-jogo)",
         value=bool(st.session_state.get("use_dynamic_elo", True)),
-        key="use_dynamic_elo",
-        help="Se ligado, calcula Elo no histórico e usa como força relativa no Poisson e ML."
+        key="use_dynamic_elo"
     )
 
-    base_elo = st.slider(
-        "Elo inicial (base)",
-        1200, 1800,
-        value=int(st.session_state.get("base_elo", 1500)),
-        step=10,
-        disabled=not use_dynamic_elo,
-        key="base_elo"
+    base_elo = st.slider("Elo inicial (base)", 1200, 1800,
+                         value=int(st.session_state.get("base_elo", 1500)),
+                         step=10, disabled=not use_dynamic_elo, key="base_elo")
+
+    elo_k_slider = st.slider("K (reação do Elo)", 5, 60,
+                             value=int(st.session_state.get("elo_k_slider", 20)),
+                             step=1, disabled=not use_dynamic_elo, key="elo_k_slider")
+
+    elo_hfa = st.slider("Vantagem de casa (HFA Elo)", 0, 120,
+                        value=int(st.session_state.get("elo_hfa", 65)),
+                        step=1, disabled=not use_dynamic_elo, key="elo_hfa")
+
+    elo_use_mov = st.checkbox("Usar margem de vitória (MOV)", value=bool(st.session_state.get("elo_use_mov", True)),
+                              disabled=not use_dynamic_elo, key="elo_use_mov")
+
+    elo_per_league = st.checkbox("Elo separado por liga", value=bool(st.session_state.get("elo_per_league", True)),
+                                 disabled=not use_dynamic_elo, key="elo_per_league")
+
+    st.divider()
+    st.header("ML + recomendação")
+    use_ml = st.checkbox("Comparar com ML (RandomForest)", value=bool(st.session_state.get("use_ml", False)), key="use_ml")
+
+    risk_profile = st.selectbox(
+        "Perfil de risco",
+        ["Conservador", "Equilibrado", "Agressivo"],
+        index=1,
+        key="risk_profile",
+        help="Conservador evita 1X2; Equilibrado padrão; Agressivo aceita prob. menor se houver consistência."
     )
 
-    elo_k = st.slider(
-        "K (reação do Elo)",
-        5, 60,
-        value=int(st.session_state.get("elo_k", 20)),
-        step=1,
-        disabled=not use_dynamic_elo,
-        key="elo_k"
-    )
-
-    elo_hfa = st.slider(
-        "Vantagem de casa (HFA em pontos Elo)",
-        0, 120,
-        value=int(st.session_state.get("elo_hfa", 65)),
-        step=1,
-        disabled=not use_dynamic_elo,
-        key="elo_hfa"
-    )
-
-    elo_use_mov = st.checkbox(
-        "Usar margem de vitória (MOV)",
-        value=bool(st.session_state.get("elo_use_mov", True)),
-        disabled=not use_dynamic_elo,
-        key="elo_use_mov",
-        help="Se ligado, vitórias por mais gols atualizam um pouco mais o Elo."
-    )
-
-    elo_per_league = st.checkbox(
-        "Elo separado por liga",
-        value=bool(st.session_state.get("elo_per_league", True)),
-        disabled=not use_dynamic_elo,
-        key="elo_per_league",
-        help="Recomendado: evita 'misturar' força entre ligas diferentes."
-    )
-
+    st.divider()
+    st.header("Backtest (Upgrade 3)")
+    bt_enable = st.checkbox("Ativar backtest rolling", value=False, key="bt_enable")
+    bt_last_n = st.slider("Testar últimos N jogos", 80, 600, value=250, step=10, key="bt_last_n")
+    bt_min_hist = st.slider("Mínimo de histórico antes de testar", 80, 300, value=120, step=10, key="bt_min_hist")
+    bt_bins = st.slider("Bins do gráfico de calibração", 5, 20, value=10, step=1, key="bt_bins")
+    bt_market = st.selectbox("Mercado para calibração", ["Over 2.5", "BTTS Sim"], index=0, key="bt_market")
+    ev_th = st.slider("EV mínimo (1X2) p/ apostar", -0.05, 0.20, value=0.02, step=0.01, key="ev_th")
+    ev_min_prob = st.slider("Probabilidade mínima (1X2)", 0.0, 0.8, value=0.0, step=0.05, key="ev_min_prob")
 
 
 # =========================
 # Carregar dados
 # =========================
 
+if not url1.strip():
+    st.error("Informe a URL da temporada atual.")
+    st.stop()
+
 try:
-    if source == "Dataset fictício":
-        played = make_sample_dataset()
-        has_two_seasons = False
-    else:
-        if not url1.strip():
-            st.stop()
-        df_current = load_url_normalized(url1.strip(), league_override, "CURRENT")
+    df_current = load_url_normalized(url1.strip(), league_override, "CURRENT")
 
-        df_prev = None
-        has_two_seasons = bool(url2.strip())
-        if has_two_seasons:
-            df_prev = load_url_normalized(url2.strip(), league_override, "PREV")
+    df_prev = None
+    has_two = bool(url2.strip())
+    if has_two:
+        df_prev = load_url_normalized(url2.strip(), league_override, "PREV")
 
-        played = combine_histories(df_current, df_prev)
-
+    played = combine_histories(df_current, df_prev)
 except Exception as e:
     st.error(f"Erro ao carregar/normalizar dados: {e}")
     st.stop()
 
 if played.empty:
-    st.error("Nenhum jogo com placar encontrado. Histórico vazio.")
+    st.error("Histórico vazio.")
     st.stop()
 
-if source == "URL (1 ou 2 temporadas)" and has_two_seasons and use_recency:
+# Ponderação por recência
+if has_two and use_recency:
     weights_by_season = {"CURRENT": int(w_current) / 100.0, "PREV": (100 - int(w_current)) / 100.0}
 else:
     seasons = sorted(played["season_tag"].astype(str).unique().tolist())
     weights_by_season = {s: 1.0 for s in seasons}
 
-n_current = int((played["season_tag"] == "CURRENT").sum()) if "season_tag" in played.columns else len(played)
-n_prev = int((played["season_tag"] == "PREV").sum()) if "season_tag" in played.columns else 0
-
-
-# =========================
-# Aplicar Elo dinâmico no histórico (antes do modelo)
-# =========================
-
-if bool(st.session_state.get("use_dynamic_elo", True)):
+# Aplicar Elo dinâmico (pré-partida)
+if use_dynamic_elo:
     try:
         played = add_dynamic_elo_columns(
             played,
-            base_elo=float(st.session_state.get("base_elo", 1500)),
-            k=float(st.session_state.get("elo_k", 20)),
-            hfa=float(st.session_state.get("elo_hfa", 65)),
-            use_mov=bool(st.session_state.get("elo_use_mov", True)),
-            per_league=bool(st.session_state.get("elo_per_league", True)),
+            base_elo=float(base_elo),
+            k=float(elo_k_slider),
+            hfa=float(elo_hfa),
+            use_mov=bool(elo_use_mov),
+            per_league=bool(elo_per_league),
         )
-    except Exception as _e:
-        st.warning(f"Falha ao calcular Elo dinâmico (seguindo com Elo padrão do dataset): {_e}")
+    except Exception as e:
+        st.warning(f"Falha ao calcular Elo dinâmico. Seguindo com Elo padrão: {e}")
 
-st.info(f"Histórico: **{len(played)} jogos** | CURRENT: {n_current} | PREV: {n_prev} | Pesos: {weights_by_season}")
-
-with st.expander("📄 Preview do histórico"):
-    st.dataframe(played.tail(60), use_container_width=True)
-
-
-# =========================
-# Filtros: liga / times
-# =========================
-
+# Auto rho por liga
 leagues = sorted(played["league"].dropna().astype(str).unique().tolist())
 teams_all = sorted(set(played["home_team"].dropna().astype(str).unique().tolist()) | set(played["away_team"].dropna().astype(str).unique().tolist()))
+
+st.info(f"Histórico: **{len(played)} jogos** | Pesos: {weights_by_season} | Elo dinâmico: {use_dynamic_elo} | Dixon–Coles: {use_dc}")
+
+with st.expander("📄 Preview do histórico"):
+    st.dataframe(played.tail(80), use_container_width=True)
+
+# =========================
+# Seleção jogo
+# =========================
 
 colA, colB, colC = st.columns([1.2, 1, 1])
 with colA:
@@ -1431,31 +1156,47 @@ if home_team == away_team:
     st.warning("Selecione times diferentes.")
     st.stop()
 
+if use_dc:
+    rho_suggested = DC_RHO_PRESETS.get(str(league), float(dc_rho))
+    rho_used = float(rho_suggested) if auto_rho else float(dc_rho)
+    if auto_rho:
+        st.caption(f"ρ sugerido (preset da liga): {rho_suggested:+.2f} | ρ efetivo usado: {rho_used:+.2f}")
+    else:
+        st.caption(f"ρ efetivo usado (manual): {rho_used:+.2f}")
+else:
+    rho_used = float(dc_rho)
+
+
+# Aplicar preset rho sugerido pela liga (se ligado)
+if use_dc and auto_rho:
+    if ("last_league_for_rho" not in st.session_state) or (st.session_state["last_league_for_rho"] != str(league)):
+        st.session_state["last_league_for_rho"] = str(league)
 st.divider()
 
-
 # =========================
-# Poisson — jogo único
+# Previsão Poisson/DC
 # =========================
 
 lam_h, lam_a, dbgP = estimate_expected_goals_poisson(
     played, league, home_team, away_team,
-    n_last=n_last, weights_by_season=weights_by_season
+    n_last=int(n_last),
+    weights_by_season=weights_by_season
 )
 
-
-# Matriz de placares (Poisson clássico ou Dixon–Coles)
-if bool(st.session_state.get("use_dc", True)):
-    rho = float(st.session_state.get("dc_rho", -0.06))
-    matP = score_matrix_dixon_coles(lam_h, lam_a, max_goals=max_goals, rho=rho)
+if use_dc:
+    matP = score_matrix_dixon_coles(lam_h, lam_a, max_goals=int(max_goals), rho=float(dc_rho))
+    mode_label = f"Dixon–Coles (ρ={float(dc_rho):.2f})"
 else:
-    matP = score_matrix_poisson(lam_h, lam_a, max_goals=max_goals)
+    matP = score_matrix_poisson(lam_h, lam_a, max_goals=int(max_goals))
+    mode_label = "Poisson"
+
 topP, botP = list_top_bottom_scores(matP, k=5)
 probsP = probs_1x2_over_btts(matP)
 
+# Métricas topo
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("λ Mandante (Poisson)", f"{lam_h:.2f}")
-c2.metric("λ Visitante (Poisson)", f"{lam_a:.2f}")
+c1.metric("λ Mandante", f"{lam_h:.2f}")
+c2.metric("λ Visitante", f"{lam_a:.2f}")
 c3.metric("1 (Mandante)", f"{pct(probsP['home_win']):.1f}%")
 c4.metric("X (Empate)", f"{pct(probsP['draw']):.1f}%")
 c5.metric("2 (Visitante)", f"{pct(probsP['away_win']):.1f}%")
@@ -1467,110 +1208,107 @@ c8.metric("BTTS (Sim)", f"{pct(probsP['btts_yes']):.1f}%")
 c9.metric("BTTS (Não)", f"{pct(probsP['btts_no']):.1f}%")
 c10.metric("Total gols (liga, médio)", f"{league_goal_averages(played, league, weights_by_season)['avg_total_goals']:.2f}")
 
-# ✅ Alerta de extremos (Poisson)
-extP, msgsP = lambda_extremes(lam_h, lam_a)
-if extP:
-    st.warning("⚠️ Alerta: λ extremo no Poisson. Isso pode distorcer placares e mercados.")
-    for m in msgsP:
-        st.caption(f"- {m}")
-
+# Heatmap + placares
 left, right = st.columns([1.2, 1])
 with left:
-    st.subheader("Matriz de placares — Poisson")
-    
-mode_label = "Dixon–Coles" if bool(st.session_state.get("use_dc", True)) else "Poisson"
-fig = heatmap_figure(matP * 100.0, f"Probabilidade (%) por placar ({mode_label})")
-st.pyplot(fig, clear_figure=True)
+    st.subheader(f"Matriz de placares — {mode_label}")
+    fig = heatmap_figure(matP * 100.0, f"Probabilidade (%) por placar — {mode_label}")
+    st.pyplot(fig, clear_figure=True)
 
 with right:
-    st.subheader("Placares mais / menos prováveis — Poisson")
-    t = topP.copy()
-    t["prob_%"] = t["prob_%"].astype(float).round(3)
+    st.subheader("Placares mais / menos prováveis")
     st.markdown("**Top 5 mais prováveis**")
-    st.dataframe(
-        t[["placar", "prob_%"]].style.format({"prob_%": "{:.3f}%"}).background_gradient(subset=["prob_%"]),
-        use_container_width=True
-    )
+    t = topP.copy()
+    t["prob_%"] = t["prob_%"].round(3)
+    st.dataframe(t[["placar", "prob_%"]].style.format({"prob_%": "{:.3f}%"}).background_gradient(subset=["prob_%"]), use_container_width=True)
 
-    b = botP.copy()
-    b["prob_%"] = b["prob_%"].astype(float).round(6)
     st.markdown("**Top 5 menos prováveis**")
+    b = botP.copy()
+    b["prob_%"] = b["prob_%"].round(6)
     st.dataframe(b[["placar", "prob_%"]].style.format({"prob_%": "{:.6f}%"}), use_container_width=True)
 
-with st.expander("🔎 Detalhes do cálculo (Poisson/Dixon–Coles)"):
-    dbgP2 = dict(dbgP)
-    dbgP2["poisson_mode"] = "Dixon–Coles" if bool(st.session_state.get("use_dc", True)) else "Poisson"
-    dbgP2["dixon_coles_rho"] = float(st.session_state.get("dc_rho", -0.06)) if bool(st.session_state.get("use_dc", True)) else None
-    st.json(dbgP2)
+# Comparação low-scores se Dixon–Coles ligado
+if use_dc:
+    mat_plain = score_matrix_poisson(lam_h, lam_a, max_goals=int(max_goals))
+    rows = []
+    for (hg, ag) in [(0, 0), (1, 0), (0, 1), (1, 1)]:
+        if hg in mat_plain.index and ag in mat_plain.columns:
+            rows.append({
+                "Placar": f"{hg}x{ag}",
+                "Poisson (%)": 100.0 * float(mat_plain.loc[hg, ag]),
+                "Dixon–Coles (%)": 100.0 * float(matP.loc[hg, ag]),
+                "Delta (p.p.)": 100.0 * float(matP.loc[hg, ag] - mat_plain.loc[hg, ag]),
+            })
+    with st.expander("📌 Efeito do Dixon–Coles nos placares baixos (0–0/1–0/0–1/1–1)"):
+        df_ls = pd.DataFrame(rows)
+        st.dataframe(df_ls.style.format({"Poisson (%)": "{:.3f}", "Dixon–Coles (%)": "{:.3f}", "Delta (p.p.)": "{:+.3f}"}), use_container_width=True)
+        st.caption("Se o delta ficar exagerado, reduza |ρ| no slider.")
+
+with st.expander("🔎 Detalhes do cálculo (Poisson/DC)"):
+    dbg = dict(dbgP)
+    dbg["mode"] = mode_label
+    st.json(dbg)
 
 st.divider()
 
+# =========================
+# Odds/EV (do CSV) — se existirem
+# =========================
+
+st.subheader("💰 EV (Valor Esperado) — usando odds do CSV (se houver)")
+st.caption("EV = p_modelo * odds - 1. EV > 0 sugere valor (aposta com expectativa positiva).")
+
+# Tenta achar odds do jogo selecionado (mesma liga + times) no histórico mais recente (apenas para demonstrar)
+df_match_odds = played[(played["league"] == league) & (played["home_team"] == home_team) & (played["away_team"] == away_team)].copy()
+df_match_odds = df_match_odds.sort_values("date_dt").tail(1)
+if len(df_match_odds) == 0:
+    st.info("Não encontrei uma linha desse confronto no histórico para exibir odds. (Normal em alguns datasets).")
+else:
+    r = df_match_odds.iloc[0]
+    oh, od, oa = r.get("home_odds", np.nan), r.get("draw_odds", np.nan), r.get("away_odds", np.nan)
+    ev_h = ev_from_odds(probsP["home_win"], float(oh)) if np.isfinite(oh) else None
+    ev_d = ev_from_odds(probsP["draw"], float(od)) if np.isfinite(od) else None
+    ev_a = ev_from_odds(probsP["away_win"], float(oa)) if np.isfinite(oa) else None
+
+    ev_table = pd.DataFrame([
+        {"Mercado": "1 (Mandante)", "Odds": oh, "Prob (modelo)": probsP["home_win"], "EV": ev_h},
+        {"Mercado": "X (Empate)", "Odds": od, "Prob (modelo)": probsP["draw"], "EV": ev_d},
+        {"Mercado": "2 (Visitante)", "Odds": oa, "Prob (modelo)": probsP["away_win"], "EV": ev_a},
+    ])
+
+    st.dataframe(
+        ev_table.style.format({
+            "Odds": "{:.2f}",
+            "Prob (modelo)": "{:.3f}",
+            "EV": "{:+.3f}",
+        }),
+        use_container_width=True
+    )
+
+st.divider()
 
 # =========================
-# Final probabilities (para EV): por padrão Poisson
-# =========================
-
-probs_final = probsP.copy()
-probs_final_label = "Poisson"
-confidence_score_final: Optional[int] = None
-confidence_label_final: Optional[str] = None
-
-# odds automáticas (The Odds API)
-odds_auto: Dict[str, Optional[float]] = {k: None for k in MARKET_LABELS.keys()}
-sport_key_auto = (sport_key_override.strip() if sport_key_override.strip() else LEAGUE_TO_ODDSAPI_SPORT.get(league, "soccer_epl"))
-
-if odds_source == "The Odds API":
-    if not odds_api_key.strip():
-        st.warning("Odds API selecionada, mas a API Key está vazia. Preencha no sidebar.")
-    else:
-        try:
-            with st.spinner("Buscando odds na The Odds API..."):
-                odds_auto = oddsapi_get_odds_for_fixture(
-                    api_key=odds_api_key.strip(),
-                    sport_key=sport_key_auto,
-                    regions=odds_region,
-                    bookmaker_pref=bookmaker_pref.strip() if bookmaker_pref.strip() else "Best price",
-                    home_team_app=home_team,
-                    away_team_app=away_team,
-                )
-            found_any = any(v is not None for v in odds_auto.values())
-            if not found_any:
-                st.info("Não encontrei odds automáticas (ou o match do jogo ficou fraco). Use Manual ou ajuste o Sport key/bookmaker.")
-        except Exception as e:
-            st.warning(f"Falha ao buscar odds na The Odds API: {e}")
-
-
-# =========================
-# ML + Confiança + Alertas + Recomendação + Texto
+# ML + Confiança + Recomendação
 # =========================
 
 if use_ml:
     try:
         with st.spinner("Treinando ML (RandomForest)..."):
-            trained = train_ml_models_cached(played, n_last=n_last, weights_by_season=weights_by_season)
+            trained = train_ml_models_cached(played, n_last=int(n_last), weights_by_season=weights_by_season)
 
         lam_h_ml, lam_a_ml, dbgM = predict_expected_goals_ml(
             played, league, home_team, away_team,
-            trained=trained, n_last=n_last, weights_by_season=weights_by_season
+            trained=trained, n_last=int(n_last), weights_by_season=weights_by_season
         )
 
-        matM = score_matrix_poisson(lam_h_ml, lam_a_ml, max_goals=max_goals)
-        topM, botM = list_top_bottom_scores(matM, k=5)
+        matM = score_matrix_poisson(lam_h_ml, lam_a_ml, max_goals=int(max_goals))
         probsM = probs_1x2_over_btts(matM)
 
         score, diffs_pp = confidence_score_from_models(probsP, probsM)
         label = confidence_label(score)
+        recs = recommended_markets(probsP, probsM, diffs_pp, profile=str(risk_profile))
 
-        # ✅ Recomendações respeitando perfil de risco
-        recs = recommended_markets(probsP, probsM, diffs_pp, profile=risk_profile)
-
-        # ✅ Atualiza probs finais para EV: média Poisson + ML
-        probs_final = {k: 0.5 * (probsP[k] + probsM[k]) for k in MARKET_LABELS.keys()}
-        probs_final_label = "Média (Poisson + ML)"
-        confidence_score_final = int(score)
-        confidence_label_final = str(label)
-
-        st.subheader("Comparação — Poisson vs ML (RandomForest) + Confiança")
+        st.subheader("🤖 Comparação — Poisson/DC vs ML + Confiança")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("λ Mandante (ML)", f"{lam_h_ml:.2f}")
         c2.metric("λ Visitante (ML)", f"{lam_a_ml:.2f}")
@@ -1579,37 +1317,7 @@ if use_ml:
         c5.metric("Confiança", f"{score}/100")
         c6.metric("Nível", label)
 
-        # ✅ Alerta de extremos (ML)
-        extM, msgsM = lambda_extremes(lam_h_ml, lam_a_ml)
-        extremes_msgs = []
-        if extP:
-            extremes_msgs.extend([f"(Poisson) {m}" for m in msgsP])
-        if extM:
-            extremes_msgs.extend([f"(ML) {m}" for m in msgsM])
-
-        if extM:
-            st.warning("⚠️ Alerta: λ extremo no ML. Use com cautela (pode ser poucos dados/viés recente).")
-            for m in msgsM:
-                st.caption(f"- {m}")
-
-        st.markdown("### ✅ Alertas por mercado (consistência Poisson × ML)")
-        st.caption("Verde: modelos concordam | Amarelo: divergência moderada | Vermelho: divergência alta (mais risco).")
-
-        cols = st.columns(7)
-        keys_order = ["home_win", "draw", "away_win", "over_2_5", "under_2_5", "btts_yes", "btts_no"]
-        for i, k in enumerate(keys_order):
-            diff = float(diffs_pp[k])
-            lvl = market_level(diff)
-            text = f"{MARKET_LABELS[k]}\n{diff:.1f} p.p."
-            if lvl == "verde":
-                cols[i].success(text)
-            elif lvl == "amarelo":
-                cols[i].warning(text)
-            else:
-                cols[i].error(text)
-
         st.markdown("### 🎯 Mercado recomendado (automático)")
-        st.caption(f"Perfil aplicado: **{risk_profile}**")
         top1 = recs[0]
         st.info(
             f"**Top 1:** {top1['mercado']} — divergência **{top1['diff_pp']:.2f} p.p.** | "
@@ -1619,153 +1327,76 @@ if use_ml:
             alt_str = " | ".join([f"{r['mercado']} ({r['diff_pp']:.1f} p.p.)" for r in recs[1:]])
             st.caption(f"Alternativas: {alt_str}")
 
-        st.markdown("### 📝 Análise automática do jogo")
-        analysis = auto_analysis_text(
-            league=league,
-            home_team=home_team,
-            away_team=away_team,
-            probsP=probsP,
-            probsM=probsM,
-            diffs_pp=diffs_pp,
-            score=score,
-            label=label,
-            lam_h=lam_h,
-            lam_a=lam_a,
-            lam_h_ml=lam_h_ml,
-            lam_a_ml=lam_a_ml,
-            recs=recs,
-            risk_profile=risk_profile,
-            extremes_msgs=extremes_msgs,
-        )
-        st.markdown(analysis)
-
-        tab1, tab2, tab3, tab4 = st.tabs(["Heatmap ML", "Top/Bottom ML", "Resumo Mercados", "Divergências"])
-        with tab1:
-            fig2 = heatmap_figure(matM * 100.0, "Probabilidade (%) por placar (ML -> λ -> Poisson)")
-            st.pyplot(fig2, clear_figure=True)
-
-        with tab2:
-            l, r = st.columns(2)
-            with l:
-                tm = topM.copy()
-                tm["prob_%"] = tm["prob_%"].astype(float).round(3)
-                st.markdown("**Top 5 mais prováveis (ML)**")
-                st.dataframe(
-                    tm[["placar", "prob_%"]].style.format({"prob_%": "{:.3f}%"}).background_gradient(subset=["prob_%"]),
-                    use_container_width=True
-                )
-            with r:
-                bm = botM.copy()
-                bm["prob_%"] = bm["prob_%"].astype(float).round(6)
-                st.markdown("**Top 5 menos prováveis (ML)**")
-                st.dataframe(bm[["placar", "prob_%"]].style.format({"prob_%": "{:.6f}%"}), use_container_width=True)
-
-        with tab3:
-            cmp = pd.DataFrame({
-                "Mercado": [MARKET_LABELS[k] for k in keys_order],
-                "Poisson (%)": [100*probsP[k] for k in keys_order],
-                "ML (%)": [100*probsM[k] for k in keys_order],
-            })
-            st.dataframe(
-                cmp.style.format({"Poisson (%)": "{:.2f}", "ML (%)": "{:.2f}"}).background_gradient(subset=["Poisson (%)", "ML (%)"]),
-                use_container_width=True
-            )
-
-        with tab4:
-            dd = pd.DataFrame({
-                "Mercado": [MARKET_LABELS[k] for k in keys_order],
-                "Diferença (p.p.)": [diffs_pp[k] for k in keys_order],
-                "Nível": [market_level(diffs_pp[k]) for k in keys_order],
-            })
-            st.dataframe(
-                dd.style.format({"Diferença (p.p.)": "{:.2f}"}).background_gradient(subset=["Diferença (p.p.)"]),
-                use_container_width=True
-            )
-
         with st.expander("🔎 Detalhes do ML"):
             st.json(dbgM)
 
     except Exception as e:
         st.error(f"Falha ao treinar/rodar ML: {e}")
 
-
-# =========================
-# EV (Valor Esperado) — sempre disponível
-# =========================
-
 st.divider()
-st.subheader("💰 EV — Expectativa de Valor (EV+ / EV-)")
 
-st.caption(
-    f"Probabilidade usada: **{probs_final_label}**. "
-    + (f"Confiança: **{confidence_score_final}/100 ({confidence_label_final})**." if confidence_score_final is not None else "Confiança: (ML desligado/indisponível).")
-)
+# =========================
+# Upgrade 3 — Backtest + Calibração + ROI EV+
+# =========================
 
-# Mostrar odds automáticas encontradas (se houver)
-with st.expander("📌 Odds automáticas detectadas (The Odds API)"):
-    if odds_source != "The Odds API":
-        st.info("Fonte de odds está em Manual.")
-    else:
-        st.write(f"Sport key usado: **{sport_key_auto}** | Região: **{odds_region}** | Bookmaker: **{bookmaker_pref}**")
-        df_auto = pd.DataFrame([{"Mercado": MARKET_LABELS[k], "Odd": odds_auto.get(k, None)} for k in MARKET_LABELS.keys()])
-        st.dataframe(df_auto, use_container_width=True)
+if bt_enable:
+    st.subheader("🧪 Backtest rolling + Calibração (Upgrade 3)")
+    try:
+        # parâmetros do modelo
+        use_dc_bt = bool(use_dc)
+        rho_bt = float(dc_rho) if use_dc_bt else 0.0
+        home_adv_bt = 0.12
+        elo_k_bt = 0.10
 
-market_key = st.selectbox(
-    "Mercado para calcular EV",
-    list(MARKET_LABELS.keys()),
-    format_func=lambda k: MARKET_LABELS[k],
-    index=0
-)
+        with st.spinner("Rodando backtest rolling..."):
+            df_bt = run_rolling_backtest(
+                matches=played,
+                league=league,
+                n_last=int(n_last),
+                max_goals=int(max_goals),
+                weights_by_season=weights_by_season,
+                use_dc=use_dc_bt,
+                rho=rho_bt,
+                home_advantage=float(home_adv_bt),
+                elo_k=float(elo_k_bt),
+                min_hist_matches=int(bt_min_hist),
+                test_last_n=int(bt_last_n),
+            )
 
-p_model = clamp_prob(float(probs_final[market_key]))
-fair = fair_odds(p_model)
+        mets = backtest_metrics(df_bt)
 
-# Odds: preferir automática se veio da API e se o usuário escolheu API
-odd_auto_value = odds_auto.get(market_key, None) if odds_source == "The Odds API" else None
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Brier (1X2)", f"{mets['brier_1x2']:.4f}")
+        c2.metric("LogLoss (1X2)", f"{mets['logloss_1x2']:.4f}")
+        c3.metric("Brier (Over2.5)", f"{mets['brier_over25']:.4f}")
+        c4.metric("Brier (BTTS)", f"{mets['brier_btts']:.4f}")
 
-odds_mode = st.radio(
-    "Fonte da odd",
-    ["Automática (The Odds API)", "Manual"] if odd_auto_value is not None else ["Manual"],
-    index=0 if odd_auto_value is not None else 0,
-    horizontal=True
-)
+        st.caption("Brier menor = melhor calibração. LogLoss menor = melhor probabilidade (penaliza erros confiantes).")
 
-odd_used: float
-if odds_mode.startswith("Automática") and odd_auto_value is not None:
-    odd_used = float(odd_auto_value)
-    st.info(f"Odd automática: **{odd_used:.2f}**")
-else:
-    odd_used = float(st.number_input("Odd decimal (ex.: 1.85)", min_value=1.01, max_value=100.0, value=1.85, step=0.01))
+        roi = roi_evplus_1x2(df_bt, ev_threshold=float(ev_th), min_prob=float(ev_min_prob))
+        c5, c6, c7 = st.columns(3)
+        c5.metric("Apostas (EV+)", f"{int(roi['bets'])}")
+        c6.metric("Lucro (unid.)", f"{roi['profit']:.2f}")
+        c7.metric("ROI", f"{roi['roi']*100:.2f}%")
 
-ev = expected_value(p_model, odd_used)
-ev_pct = ev * 100.0
+        # Reliability curve
+        if bt_market == "Over 2.5":
+            y_true = df_bt["y_over25"].astype(int).values
+            y_prob = df_bt["p_over25"].astype(float).values
+            title = "Calibração — Over 2.5"
+        else:
+            y_true = df_bt["y_btts"].astype(int).values
+            y_prob = df_bt["p_btts"].astype(float).values
+            title = "Calibração — BTTS (Sim)"
 
-ev_adj = ev
-if confidence_score_final is not None:
-    ev_adj = ev * (confidence_score_final / 100.0)
+        st.markdown("### 📈 Gráfico de calibração (Reliability curve)")
+        fig_cal = plot_reliability(y_true=y_true, y_prob=y_prob, n_bins=int(bt_bins), title=title)
+        st.pyplot(fig_cal, clear_figure=True)
 
-ev_adj_pct = ev_adj * 100.0
+        with st.expander("📄 Ver amostra do backtest"):
+            st.dataframe(df_bt.tail(80), use_container_width=True)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Prob. do modelo", f"{p_model*100:.2f}%")
-c2.metric("Odd justa (1/p)", f"{fair:.2f}" if fair is not None else "—")
-c3.metric("EV (%)", f"{ev_pct:+.2f}%")
-c4.metric("EV ajustado confiança (%)", f"{ev_adj_pct:+.2f}%" if confidence_score_final is not None else "—")
+    except Exception as e:
+        st.error(f"Backtest/Calibração falhou: {e}")
 
-if ev > 0:
-    st.success("✅ **EV+ (Valor Esperado Positivo)** — tendência favorável no longo prazo (se o modelo estiver bem calibrado).")
-else:
-    st.error("❌ **EV- (Valor Esperado Negativo)** — a odd não compensa a probabilidade estimada pelo modelo.")
-
-with st.expander("ℹ️ Como interpretar o EV"):
-    st.markdown(
-        """
-- Fórmula: **EV = p × odd − 1**
-- **EV > 0** → Expectativa Positiva (EV+)  
-- **EV < 0** → Expectativa Negativa (EV-)  
-- **Odd justa**: **1/p** (se o mercado paga acima disso, tende a ser EV+)
-- Quando ML está ligado, mostramos também **EV ajustado**: **EV × (confiança/100)** (heurística de risco).
-"""
-    )
-
-st.caption("Dica: perfil de risco muda o ranking; alerta de extremos avisa quando λ está fora do padrão esperado.")
+st.caption("Pronto. Se quiser, o próximo passo é colocar sua API key da Odds API em st.secrets para deploy seguro.")
