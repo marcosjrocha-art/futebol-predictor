@@ -706,6 +706,57 @@ def league_goal_averages(matches: pd.DataFrame, league: str, weights_by_season: 
 # Poisson
 # =========================
 
+# =========================
+# Dixon–Coles (Upgrade 2) — DIXON_COLES_V1
+# =========================
+
+def dixon_coles_tau(hg: int, ag: int, lam_h: float, lam_a: float, rho: float) -> float:
+    """
+    Fator de correção τ(hg,ag) de Dixon–Coles para low-scores.
+    Fórmulas clássicas:
+      τ00 = 1 - (λh*λa*rho)
+      τ01 = 1 + (λh*rho)
+      τ10 = 1 + (λa*rho)
+      τ11 = 1 - rho
+    Para outros placares, τ = 1.
+    """
+    if hg == 0 and ag == 0:
+        return 1.0 - (lam_h * lam_a * rho)
+    if hg == 0 and ag == 1:
+        return 1.0 + (lam_h * rho)
+    if hg == 1 and ag == 0:
+        return 1.0 + (lam_a * rho)
+    if hg == 1 and ag == 1:
+        return 1.0 - rho
+    return 1.0
+
+def score_matrix_dixon_coles(lambda_home: float, lambda_away: float, max_goals: int, rho: float) -> pd.DataFrame:
+    """
+    Matriz de placares usando Poisson * τ (Dixon–Coles) nos low-scores.
+    Observação: como truncamos em 0..max_goals, normalizamos a soma para 1.
+    """
+    hs = np.arange(0, max_goals + 1)
+    as_ = np.arange(0, max_goals + 1)
+
+    p_home = poisson.pmf(hs, mu=lambda_home)
+    p_away = poisson.pmf(as_, mu=lambda_away)
+
+    mat = np.outer(p_home, p_away)
+
+    # aplica τ nos low scores (0/1)
+    for hg in [0, 1]:
+        for ag in [0, 1]:
+            if hg <= max_goals and ag <= max_goals:
+                mat[hg, ag] = mat[hg, ag] * dixon_coles_tau(hg, ag, lambda_home, lambda_away, rho)
+
+    # normaliza (por truncamento)
+    s = float(mat.sum())
+    if s > 0:
+        mat = mat / s
+
+    return pd.DataFrame(mat, index=hs, columns=as_)
+
+
 def estimate_expected_goals_poisson(
     matches: pd.DataFrame,
     league: str,
@@ -1181,6 +1232,26 @@ with st.sidebar:
         key="max_goals"
     )
 
+    st.divider()
+    st.subheader("Poisson avançado (Dixon–Coles)")
+    use_dc = st.checkbox(
+        "Ativar Dixon–Coles (corrige placares baixos / empates)",
+        value=bool(st.session_state.get("use_dc", True)),
+        key="use_dc",
+        help="Ajusta 0-0, 1-0, 0-1, 1-1 via parâmetro ρ. Bom para ligas com jogos truncados/unders."
+    )
+
+    dc_rho = st.slider(
+        "ρ (rho) — intensidade do ajuste low-score",
+        -0.25, 0.25,
+        value=float(st.session_state.get("dc_rho", -0.06)),
+        step=0.01,
+        disabled=not use_dc,
+        key="dc_rho",
+        help="Valores típicos ficam levemente negativos (ex.: -0.10 a -0.02). Se exagerar, distorce empates/unders."
+    )
+
+
     use_ml = st.checkbox(
         "Comparar com ML (RandomForest)",
         value=bool(st.session_state.get("use_ml", False)),
@@ -1372,7 +1443,13 @@ lam_h, lam_a, dbgP = estimate_expected_goals_poisson(
     n_last=n_last, weights_by_season=weights_by_season
 )
 
-matP = score_matrix_poisson(lam_h, lam_a, max_goals=max_goals)
+
+# Matriz de placares (Poisson clássico ou Dixon–Coles)
+if bool(st.session_state.get("use_dc", True)):
+    rho = float(st.session_state.get("dc_rho", -0.06))
+    matP = score_matrix_dixon_coles(lam_h, lam_a, max_goals=max_goals, rho=rho)
+else:
+    matP = score_matrix_poisson(lam_h, lam_a, max_goals=max_goals)
 topP, botP = list_top_bottom_scores(matP, k=5)
 probsP = probs_1x2_over_btts(matP)
 
@@ -1400,8 +1477,10 @@ if extP:
 left, right = st.columns([1.2, 1])
 with left:
     st.subheader("Matriz de placares — Poisson")
-    fig = heatmap_figure(matP * 100.0, "Probabilidade (%) por placar (Poisson)")
-    st.pyplot(fig, clear_figure=True)
+    
+mode_label = "Dixon–Coles" if bool(st.session_state.get("use_dc", True)) else "Poisson"
+fig = heatmap_figure(matP * 100.0, f"Probabilidade (%) por placar ({mode_label})")
+st.pyplot(fig, clear_figure=True)
 
 with right:
     st.subheader("Placares mais / menos prováveis — Poisson")
@@ -1418,8 +1497,11 @@ with right:
     st.markdown("**Top 5 menos prováveis**")
     st.dataframe(b[["placar", "prob_%"]].style.format({"prob_%": "{:.6f}%"}), use_container_width=True)
 
-with st.expander("🔎 Detalhes do cálculo (Poisson)"):
-    st.json(dbgP)
+with st.expander("🔎 Detalhes do cálculo (Poisson/Dixon–Coles)"):
+    dbgP2 = dict(dbgP)
+    dbgP2["poisson_mode"] = "Dixon–Coles" if bool(st.session_state.get("use_dc", True)) else "Poisson"
+    dbgP2["dixon_coles_rho"] = float(st.session_state.get("dc_rho", -0.06)) if bool(st.session_state.get("use_dc", True)) else None
+    st.json(dbgP2)
 
 st.divider()
 
