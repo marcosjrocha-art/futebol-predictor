@@ -984,6 +984,94 @@ def plot_reliability(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10, t
 # =========================
 
 with st.sidebar:
+
+    st.divider()
+    st.header("🚀 Modos rápidos")
+
+    colm1, colm2 = st.columns(2)
+    with colm1:
+        if st.button("🔒 Modo Produção"):
+            # Produção: estabilidade, menos apostas, menos overfit
+            st.session_state["use_odds_api"] = True
+            st.session_state["odds_region"] = "eu"
+
+            st.session_state["use_recency"] = True
+            st.session_state["w_current"] = 75
+            st.session_state["n_last"] = 9
+            st.session_state["max_goals"] = 5
+
+            # Poisson avançado / DC
+            st.session_state["use_dc"] = True
+            st.session_state["auto_rho"] = True
+            st.session_state["dc_rho"] = -0.06  # usado se auto_rho desligar
+
+            # Elo dinâmico
+            st.session_state["use_elo_dynamic"] = True
+            st.session_state["elo_base"] = 1500
+            st.session_state["elo_k"] = 14
+            st.session_state["elo_hfa"] = 55
+            st.session_state["elo_use_mov"] = True
+            st.session_state["elo_by_league"] = True
+
+            # ML auditor + recomendação
+            st.session_state["use_ml"] = True
+            st.session_state["risk_profile"] = "Conservador"
+
+            # Backtest + calibração
+            st.session_state["enable_backtest"] = True
+            st.session_state["bt_test_last_n"] = 300
+            st.session_state["bt_min_history"] = 200
+            st.session_state["bt_bins"] = 10
+            st.session_state["bt_market"] = "1X2"
+
+            # Regras de aposta / EV
+            st.session_state["ev_min_1x2"] = 0.06
+            st.session_state["pmin_1x2"] = 0.50
+            st.session_state["conf_min"] = 75
+
+            st.rerun()
+
+    with colm2:
+        if st.button("🧪 Modo Laboratório"):
+            # Laboratório: mais reativo (exploração)
+            st.session_state["use_odds_api"] = True
+            st.session_state["odds_region"] = "eu"
+
+            st.session_state["use_recency"] = True
+            st.session_state["w_current"] = 85
+            st.session_state["n_last"] = 6
+            st.session_state["max_goals"] = 6
+
+            # DC ligado, porém mais “solto”
+            st.session_state["use_dc"] = True
+            st.session_state["auto_rho"] = True
+            st.session_state["dc_rho"] = -0.06
+
+            # Elo mais reativo
+            st.session_state["use_elo_dynamic"] = True
+            st.session_state["elo_base"] = 1500
+            st.session_state["elo_k"] = 20
+            st.session_state["elo_hfa"] = 65
+            st.session_state["elo_use_mov"] = True
+            st.session_state["elo_by_league"] = True
+
+            # ML sempre ligado para auditar
+            st.session_state["use_ml"] = True
+            st.session_state["risk_profile"] = "Agressivo"
+
+            # Backtest menor pra iterar rápido
+            st.session_state["enable_backtest"] = True
+            st.session_state["bt_test_last_n"] = 200
+            st.session_state["bt_min_history"] = 120
+            st.session_state["bt_bins"] = 10
+            st.session_state["bt_market"] = "Over 2.5"
+
+            # EV mais permissivo (para testar hipóteses)
+            st.session_state["ev_min_1x2"] = 0.03
+            st.session_state["pmin_1x2"] = 0.40
+            st.session_state["conf_min"] = 65
+
+            st.rerun()
     st.divider()
     st.header("The Odds API (odds)")
 
