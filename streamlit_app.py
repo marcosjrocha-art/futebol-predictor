@@ -14,6 +14,10 @@ Inclui:
 ✅ NOVO:
 - Perfil de risco (Conservador/Equilibrado/Agressivo) impacta recomendações
 - Alerta de extremos de λ (Poisson/ML) para evitar previsões “explodidas”
+✅ NOVO (EV + Odds):
+- EV (Valor Esperado) por mercado com odds manual ou automáticas
+- Integração The Odds API (região eu) para 1X2, O/U 2.5, BTTS
+- Seleção de bookmaker ou “Best price”
 
 Rodar:
   streamlit run streamlit_app.py
@@ -21,13 +25,19 @@ Rodar:
 
 from __future__ import annotations
 
+import re
+import unicodedata
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from scipy.stats import poisson
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+
+import requests
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
@@ -222,6 +232,7 @@ def normalize_matches_dataframe(raw: pd.DataFrame, default_league_label: str, se
         df["draw_odds"] = np.nan
         df["away_odds"] = np.nan
 
+    # (placeholder) Elo; você pode plugar Elo real depois
     df["home_elo"] = 1600.0
     df["away_elo"] = 1600.0
 
@@ -264,6 +275,336 @@ def load_url_normalized(url: str, league_label_override: str, season_tag: str) -
     label = league_label_override.strip() if league_label_override.strip() else "URL Dataset"
     return normalize_matches_dataframe(raw, default_league_label=label, season_tag=season_tag)
 
+
+# =========================
+# Odds API (The Odds API)
+# =========================
+
+LEAGUE_TO_ODDSAPI_SPORT = {
+    "Premier League": "soccer_epl",
+    "La Liga": "soccer_spain_la_liga",
+    "Serie A": "soccer_italy_serie_a",
+    "Bundesliga": "soccer_germany_bundesliga",
+    "Ligue 1": "soccer_france_ligue_one",
+    "Brasileirão": "soccer_brazil_campeonato",
+    "Brazil Serie A": "soccer_brazil_campeonato",
+    "Campeonato Brasileiro": "soccer_brazil_campeonato",
+    "Champions League": "soccer_uefa_champs_league",
+    "UEFA Champions League": "soccer_uefa_champs_league",
+}
+
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+def norm_team(s: str) -> str:
+    s0 = _strip_accents(str(s).lower()).strip()
+    s0 = re.sub(r"[\.\,\-\(\)\[\]\/\&\+]", " ", s0)
+    s0 = re.sub(r"\b(fc|sc|cf|ac|afc|cfc|cd|ud|sv|tsv|bk|fk|ec|cr|atletico|athletic)\b", " ", s0)
+    s0 = re.sub(r"\b(de|da|do|das|dos|the)\b", " ", s0)
+    s0 = re.sub(r"\s+", " ", s0).strip()
+    return s0
+
+def teams_match_score(home_a: str, away_a: str, home_b: str, away_b: str) -> float:
+    """
+    Score de match entre (A=app) e (B=api).
+    1.0 = perfeito; maior melhor.
+    """
+    ha, aa = norm_team(home_a), norm_team(away_a)
+    hb, ab = norm_team(home_b), norm_team(away_b)
+
+    # match direto
+    if ha == hb and aa == ab:
+        return 1.0
+
+    # sets iguais (pouco provável mas ajuda em inversões)
+    seta = {ha, aa}
+    setb = {hb, ab}
+    if seta == setb:
+        return 0.75
+
+    # token overlap
+    def tok(s: str) -> set:
+        return set(s.split())
+
+    inter = len(tok(ha) & tok(hb)) + len(tok(aa) & tok(ab))
+    denom = max(1, len(tok(ha)) + len(tok(hb)) + len(tok(aa)) + len(tok(ab)))
+    return inter / denom
+
+@st.cache_data(show_spinner=False, ttl=300)
+def oddsapi_list_soccer_sports(api_key: str) -> List[Dict[str, str]]:
+    url = "https://api.the-odds-api.com/v4/sports"
+    r = requests.get(url, params={"apiKey": api_key}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    soccer = []
+    for item in data:
+        if str(item.get("key", "")).startswith("soccer_"):
+            soccer.append({"key": item.get("key", ""), "title": item.get("title", "")})
+    return sorted(soccer, key=lambda x: x["title"])
+
+@st.cache_data(show_spinner=False, ttl=300)
+def oddsapi_fetch_odds(api_key: str, sport_key: str, regions: str, markets: str, odds_format: str = "decimal") -> List[dict]:
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    params = {
+        "apiKey": api_key,
+        "regions": regions,
+        "markets": markets,
+        "oddsFormat": odds_format,
+        "dateFormat": "iso",
+    }
+    r = requests.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+def _pick_bookmaker(books: List[dict], preference: str) -> List[dict]:
+    """
+    preference:
+      - "Best price" => usar todas para escolher melhor odd por outcome
+      - ou nome exato de bookmaker (ex.: "pinnacle", "bet365"... dependendo do catálogo)
+    """
+    if preference == "Best price":
+        return books
+    pref = preference.strip().lower()
+    chosen = [b for b in books if str(b.get("key", "")).lower() == pref or str(b.get("title", "")).lower() == pref]
+    return chosen if chosen else books
+
+def _extract_market_prices(bookmakers: List[dict], market_key: str) -> List[dict]:
+    out = []
+    for b in bookmakers:
+        for m in b.get("markets", []) or []:
+            if str(m.get("key", "")).lower() == market_key.lower():
+                out.append({"book": b, "market": m})
+    return out
+
+def oddsapi_best_price_h2h(markets_blocks: List[dict], home_name_api: str, away_name_api: str) -> Dict[str, Optional[float]]:
+    best = {"home": None, "draw": None, "away": None}
+    for blk in markets_blocks:
+        outcomes = blk["market"].get("outcomes", []) or []
+        for o in outcomes:
+            name = str(o.get("name", ""))
+            price = o.get("price", None)
+            if price is None:
+                continue
+            price = float(price)
+
+            n = norm_team(name)
+            if n == norm_team(home_name_api):
+                best["home"] = price if best["home"] is None else max(best["home"], price)
+            elif n == norm_team(away_name_api):
+                best["away"] = price if best["away"] is None else max(best["away"], price)
+            elif n == "draw":
+                best["draw"] = price if best["draw"] is None else max(best["draw"], price)
+    return best
+
+def oddsapi_best_price_totals_25(markets_blocks: List[dict]) -> Dict[str, Optional[float]]:
+    # retorna Over/Under 2.5
+    best = {"over_2_5": None, "under_2_5": None}
+    for blk in markets_blocks:
+        outcomes = blk["market"].get("outcomes", []) or []
+        for o in outcomes:
+            name = str(o.get("name", "")).lower()
+            point = o.get("point", None)
+            price = o.get("price", None)
+            if point is None or price is None:
+                continue
+            try:
+                point = float(point)
+            except Exception:
+                continue
+            if abs(point - 2.5) > 1e-9:
+                continue
+            price = float(price)
+            if "over" in name:
+                best["over_2_5"] = price if best["over_2_5"] is None else max(best["over_2_5"], price)
+            if "under" in name:
+                best["under_2_5"] = price if best["under_2_5"] is None else max(best["under_2_5"], price)
+    return best
+
+def oddsapi_best_price_btts(markets_blocks: List[dict]) -> Dict[str, Optional[float]]:
+    best = {"btts_yes": None, "btts_no": None}
+    for blk in markets_blocks:
+        outcomes = blk["market"].get("outcomes", []) or []
+        for o in outcomes:
+            name = str(o.get("name", "")).lower()
+            price = o.get("price", None)
+            if price is None:
+                continue
+            price = float(price)
+            if name in {"yes", "y"}:
+                best["btts_yes"] = price if best["btts_yes"] is None else max(best["btts_yes"], price)
+            if name in {"no", "n"}:
+                best["btts_no"] = price if best["btts_no"] is None else max(best["btts_no"], price)
+    return best
+
+def oddsapi_get_odds_for_fixture(
+    api_key: str,
+    sport_key: str,
+    regions: str,
+    bookmaker_pref: str,
+    home_team_app: str,
+    away_team_app: str,
+) -> Dict[str, Optional[float]]:
+    """
+    Busca odds 1X2, O/U 2.5, BTTS para o jogo mais próximo por nomes.
+    Retorna dict com chaves:
+      home_win, draw, away_win, over_2_5, under_2_5, btts_yes, btts_no
+    """
+    markets = "h2h,totals,btts"
+    events = oddsapi_fetch_odds(api_key, sport_key=sport_key, regions=regions, markets=markets)
+
+    if not isinstance(events, list) or len(events) == 0:
+        return {k: None for k in ["home_win","draw","away_win","over_2_5","under_2_5","btts_yes","btts_no"]}
+
+    # achar melhor match por times
+    best_event = None
+    best_score = -1.0
+    for ev in events:
+        h_api = ev.get("home_team", "")
+        a_api = ev.get("away_team", "")
+        sc = teams_match_score(home_team_app, away_team_app, h_api, a_api)
+        if sc > best_score:
+            best_score = sc
+            best_event = ev
+
+    if best_event is None or best_score < 0.25:
+        return {k: None for k in ["home_win","draw","away_win","over_2_5","under_2_5","btts_yes","btts_no"]}
+
+    books = best_event.get("bookmakers", []) or []
+    books = _pick_bookmaker(books, bookmaker_pref)
+
+    # h2h
+    h2h_blocks = _extract_market_prices(books, "h2h")
+    best_h2h = oddsapi_best_price_h2h(h2h_blocks, best_event.get("home_team",""), best_event.get("away_team",""))
+
+    # totals
+    totals_blocks = _extract_market_prices(books, "totals")
+    best_tot = oddsapi_best_price_totals_25(totals_blocks)
+
+    # btts
+    btts_blocks = _extract_market_prices(books, "btts")
+    best_btts = oddsapi_best_price_btts(btts_blocks)
+
+    return {
+        "home_win": best_h2h["home"],
+        "draw": best_h2h["draw"],
+        "away_win": best_h2h["away"],
+        "over_2_5": best_tot["over_2_5"],
+        "under_2_5": best_tot["under_2_5"],
+        "btts_yes": best_btts["btts_yes"],
+        "btts_no": best_btts["btts_no"],
+    }
+
+def oddsapi_available_bookmakers(events: List[dict]) -> List[str]:
+    keys = set()
+    titles = set()
+    for ev in events or []:
+        for b in (ev.get("bookmakers") or []):
+            if b.get("key"):
+                keys.add(str(b.get("key")).lower())
+            if b.get("title"):
+                titles.add(str(b.get("title")).lower())
+    out = sorted(keys.union(titles))
+    return out
+
+
+
+# =========================
+# Elo dinâmico (Upgrade 1) — ELO_DINAMICO_V1
+# =========================
+
+def _elo_expected_score(r_home: float, r_away: float, hfa: float) -> float:
+    """
+    Expectativa do mandante (0-1) considerando Home Field Advantage (hfa em pontos Elo).
+    """
+    return 1.0 / (1.0 + 10 ** (((r_away) - (r_home + hfa)) / 400.0))
+
+def _elo_mov_multiplier(goal_diff: int, elo_diff: float) -> float:
+    """
+    Multiplicador por margem de vitória (heurística comum).
+    goal_diff: |HG-AG|
+    elo_diff: (R_home+HFA) - R_away
+    """
+    if goal_diff <= 1:
+        return 1.0
+    # fórmula inspirada em variações clássicas de Elo no futebol
+    return (math.log(goal_diff + 1.0) * (2.2 / ((elo_diff * 0.001) + 2.2)))
+
+@st.cache_data(show_spinner=False)
+def add_dynamic_elo_columns(
+    matches: pd.DataFrame,
+    base_elo: float = 1500.0,
+    k: float = 20.0,
+    hfa: float = 65.0,
+    use_mov: bool = True,
+    per_league: bool = True,
+) -> pd.DataFrame:
+    """
+    Preenche home_elo e away_elo PRE-MATCH, calculando Elo jogo-a-jogo no histórico.
+
+    - base_elo: Elo inicial por time
+    - k: fator de atualização (quanto maior, mais reage)
+    - hfa: vantagem de casa em pontos Elo
+    - use_mov: aplica multiplicador por margem de vitória
+    - per_league: Elo separado por liga (recomendado)
+    """
+    df = matches.copy()
+    if "date_dt" not in df.columns:
+        raise ValueError("date_dt não encontrado; normalize_matches_dataframe deveria criar essa coluna.")
+
+    df = df.sort_values(["date_dt", "league", "home_team", "away_team"]).reset_index(drop=True)
+
+    # rating store
+    ratings: dict = {}  # key -> rating
+
+    def key_for(league: str, team: str) -> str:
+        return f"{league}||{team}" if per_league else team
+
+    home_elos = []
+    away_elos = []
+
+    for _, r in df.iterrows():
+        league = str(r["league"])
+        home = str(r["home_team"])
+        away = str(r["away_team"])
+
+        kh = key_for(league, home)
+        ka = key_for(league, away)
+
+        r_home = float(ratings.get(kh, base_elo))
+        r_away = float(ratings.get(ka, base_elo))
+
+        # Elo pré-jogo (o que interessa para features/modelo)
+        home_elos.append(r_home)
+        away_elos.append(r_away)
+
+        # resultado
+        hg = int(r["home_goals"])
+        ag = int(r["away_goals"])
+        if hg > ag:
+            s_home = 1.0
+        elif hg == ag:
+            s_home = 0.5
+        else:
+            s_home = 0.0
+
+        e_home = _elo_expected_score(r_home, r_away, hfa=hfa)
+        e_away = 1.0 - e_home
+
+        goal_diff = abs(hg - ag)
+        elo_diff = (r_home + hfa) - r_away
+        mult = _elo_mov_multiplier(goal_diff, elo_diff) if use_mov else 1.0
+
+        k_eff = float(k) * float(mult)
+
+        r_home_new = r_home + k_eff * (s_home - e_home)
+        r_away_new = r_away + k_eff * ((1.0 - s_home) - e_away)
+
+        ratings[kh] = r_home_new
+        ratings[ka] = r_away_new
+
+    df["home_elo"] = home_elos
+    df["away_elo"] = away_elos
+    return df
 
 # =========================
 # Forma / stats com ponderação
@@ -635,7 +976,6 @@ def market_level(diff_pp: float) -> str:
 def lambda_extremes(lh: float, la: float) -> Tuple[bool, List[str]]:
     msgs = []
     extreme = False
-    # limites práticos para futebol (heurística)
     if lh >= 3.50:
         extreme = True
         msgs.append(f"λ mandante muito alto ({lh:.2f}) → risco de superestimar goleada.")
@@ -651,40 +991,13 @@ def lambda_extremes(lh: float, la: float) -> Tuple[bool, List[str]]:
     return extreme, msgs
 
 def risk_profile_params(profile: str) -> Dict[str, object]:
-    """
-    Ajusta recomendações:
-    - Conservador: prioriza prob alta, evita mercados voláteis (1X2).
-    - Equilibrado: padrão.
-    - Agressivo: permite mais mercados e aceita prob menor se divergência for baixa.
-    """
     if profile == "Conservador":
-        return {
-            "allowed": {"over_2_5", "under_2_5", "btts_yes", "btts_no"},  # evita 1X2
-            "w_diff": 2.0,
-            "w_prob": 1.6,
-            "min_prob": 0.55,
-        }
+        return {"allowed": {"over_2_5", "under_2_5", "btts_yes", "btts_no"}, "w_diff": 2.0, "w_prob": 1.6, "min_prob": 0.55}
     if profile == "Agressivo":
-        return {
-            "allowed": set(MARKET_LABELS.keys()),
-            "w_diff": 2.2,
-            "w_prob": 0.9,
-            "min_prob": 0.40,
-        }
-    # Equilibrado
-    return {
-        "allowed": set(MARKET_LABELS.keys()),
-        "w_diff": 2.0,
-        "w_prob": 1.2,
-        "min_prob": 0.50,
-    }
+        return {"allowed": set(MARKET_LABELS.keys()), "w_diff": 2.2, "w_prob": 0.9, "min_prob": 0.40}
+    return {"allowed": set(MARKET_LABELS.keys()), "w_diff": 2.0, "w_prob": 1.2, "min_prob": 0.50}
 
-def recommended_markets(
-    probsP: Dict[str, float],
-    probsM: Dict[str, float],
-    diffs_pp: Dict[str, float],
-    profile: str
-) -> List[Dict[str, object]]:
+def recommended_markets(probsP: Dict[str, float], probsM: Dict[str, float], diffs_pp: Dict[str, float], profile: str) -> List[Dict[str, object]]:
     params = risk_profile_params(profile)
     allowed = params["allowed"]
     w_diff = float(params["w_diff"])
@@ -695,31 +1008,20 @@ def recommended_markets(
     for k, label in MARKET_LABELS.items():
         if k not in allowed:
             continue
-
         p_avg = 0.5 * (probsP[k] + probsM[k])
         diff = float(diffs_pp[k])
         lvl = market_level(diff)
 
-        # penalidade por divergência e prob baixa
         prob_penalty = 0.0
         if p_avg < min_prob:
-            prob_penalty = (min_prob - p_avg) * 100.0  # em pontos
+            prob_penalty = (min_prob - p_avg) * 100.0
 
-        # score menor é melhor
         lvl_score = {"verde": 0.0, "amarelo": 7.0, "vermelho": 18.0}[lvl]
         score = (w_diff * diff) + (w_prob * (100.0 * (1.0 - p_avg))) + lvl_score + prob_penalty
 
-        items.append({
-            "key": k,
-            "mercado": label,
-            "diff_pp": diff,
-            "prob_avg": float(p_avg),
-            "nivel": lvl,
-            "rank_score": float(score),
-        })
+        items.append({"key": k, "mercado": label, "diff_pp": diff, "prob_avg": float(p_avg), "nivel": lvl, "rank_score": float(score)})
 
-    items_sorted = sorted(items, key=lambda x: x["rank_score"])
-    return items_sorted[:3]
+    return sorted(items, key=lambda x: x["rank_score"])[:3]
 
 def auto_analysis_text(
     league: str,
@@ -784,6 +1086,22 @@ def auto_analysis_text(
 
 
 # =========================
+# EV (Valor Esperado)
+# =========================
+
+def fair_odds(p: float) -> Optional[float]:
+    if p <= 0:
+        return None
+    return 1.0 / p
+
+def expected_value(p: float, odd: float) -> float:
+    return (p * odd) - 1.0
+
+def clamp_prob(p: float) -> float:
+    return float(np.clip(p, 1e-9, 1.0 - 1e-9))
+
+
+# =========================
 # Plot helper
 # =========================
 
@@ -805,7 +1123,7 @@ def pct(x: float) -> float:
 
 
 # =========================
-# Sidebar — Fonte + Presets + Modelo + Perfil de risco
+# Sidebar — Fonte + Presets + Modelo + Perfil de risco + Odds
 # =========================
 
 with st.sidebar:
@@ -878,6 +1196,89 @@ with st.sidebar:
         help="Controla o ranking do 'mercado recomendado'. Conservador evita 1X2 e prioriza probabilidade mais alta."
     )
 
+    st.divider()
+    st.header("Odds (The Odds API)")
+    odds_source = st.radio("Fonte de odds", ["Manual", "The Odds API"], index=1, horizontal=True)
+
+    odds_api_key = st.text_input(
+        "API Key (não publique em repo)",
+        value=st.session_state.get("odds_api_key", ""),
+        type="password",
+        help="Dica: no Streamlit Cloud use Secrets para guardar a chave."
+    )
+    st.session_state["odds_api_key"] = odds_api_key
+
+    odds_region = "eu"  # fixo conforme seu pedido
+
+    auto_sport_guess = "soccer_epl"
+    # vamos escolher um default mais provável; depois do filtro de liga, o app ajusta
+    sport_key_override = st.text_input(
+        "Sport key (opcional)",
+        value=st.session_state.get("sport_key_override", ""),
+        help="Se vazio, tenta mapear pela liga (EPL, LaLiga, etc.)."
+    )
+    st.session_state["sport_key_override"] = sport_key_override
+
+    bookmaker_pref = st.text_input(
+        "Bookmaker (opcional)",
+        value=st.session_state.get("bookmaker_pref", "Best price"),
+        help="Use 'Best price' para pegar o melhor preço entre bookmakers, ou digite o nome/slug (ex.: pinnacle, bet365 se existir na API/region)."
+    )
+    st.session_state["bookmaker_pref"] = bookmaker_pref
+
+    st.divider()
+    st.header("Elo dinâmico (Upgrade 1)")
+    use_dynamic_elo = st.checkbox(
+        "Ativar Elo dinâmico (jogo-a-jogo)",
+        value=bool(st.session_state.get("use_dynamic_elo", True)),
+        key="use_dynamic_elo",
+        help="Se ligado, calcula Elo no histórico e usa como força relativa no Poisson e ML."
+    )
+
+    base_elo = st.slider(
+        "Elo inicial (base)",
+        1200, 1800,
+        value=int(st.session_state.get("base_elo", 1500)),
+        step=10,
+        disabled=not use_dynamic_elo,
+        key="base_elo"
+    )
+
+    elo_k = st.slider(
+        "K (reação do Elo)",
+        5, 60,
+        value=int(st.session_state.get("elo_k", 20)),
+        step=1,
+        disabled=not use_dynamic_elo,
+        key="elo_k"
+    )
+
+    elo_hfa = st.slider(
+        "Vantagem de casa (HFA em pontos Elo)",
+        0, 120,
+        value=int(st.session_state.get("elo_hfa", 65)),
+        step=1,
+        disabled=not use_dynamic_elo,
+        key="elo_hfa"
+    )
+
+    elo_use_mov = st.checkbox(
+        "Usar margem de vitória (MOV)",
+        value=bool(st.session_state.get("elo_use_mov", True)),
+        disabled=not use_dynamic_elo,
+        key="elo_use_mov",
+        help="Se ligado, vitórias por mais gols atualizam um pouco mais o Elo."
+    )
+
+    elo_per_league = st.checkbox(
+        "Elo separado por liga",
+        value=bool(st.session_state.get("elo_per_league", True)),
+        disabled=not use_dynamic_elo,
+        key="elo_per_league",
+        help="Recomendado: evita 'misturar' força entre ligas diferentes."
+    )
+
+
 
 # =========================
 # Carregar dados
@@ -915,6 +1316,24 @@ else:
 
 n_current = int((played["season_tag"] == "CURRENT").sum()) if "season_tag" in played.columns else len(played)
 n_prev = int((played["season_tag"] == "PREV").sum()) if "season_tag" in played.columns else 0
+
+
+# =========================
+# Aplicar Elo dinâmico no histórico (antes do modelo)
+# =========================
+
+if bool(st.session_state.get("use_dynamic_elo", True)):
+    try:
+        played = add_dynamic_elo_columns(
+            played,
+            base_elo=float(st.session_state.get("base_elo", 1500)),
+            k=float(st.session_state.get("elo_k", 20)),
+            hfa=float(st.session_state.get("elo_hfa", 65)),
+            use_mov=bool(st.session_state.get("elo_use_mov", True)),
+            per_league=bool(st.session_state.get("elo_per_league", True)),
+        )
+    except Exception as _e:
+        st.warning(f"Falha ao calcular Elo dinâmico (seguindo com Elo padrão do dataset): {_e}")
 
 st.info(f"Histórico: **{len(played)} jogos** | CURRENT: {n_current} | PREV: {n_prev} | Pesos: {weights_by_season}")
 
@@ -1006,6 +1425,40 @@ st.divider()
 
 
 # =========================
+# Final probabilities (para EV): por padrão Poisson
+# =========================
+
+probs_final = probsP.copy()
+probs_final_label = "Poisson"
+confidence_score_final: Optional[int] = None
+confidence_label_final: Optional[str] = None
+
+# odds automáticas (The Odds API)
+odds_auto: Dict[str, Optional[float]] = {k: None for k in MARKET_LABELS.keys()}
+sport_key_auto = (sport_key_override.strip() if sport_key_override.strip() else LEAGUE_TO_ODDSAPI_SPORT.get(league, "soccer_epl"))
+
+if odds_source == "The Odds API":
+    if not odds_api_key.strip():
+        st.warning("Odds API selecionada, mas a API Key está vazia. Preencha no sidebar.")
+    else:
+        try:
+            with st.spinner("Buscando odds na The Odds API..."):
+                odds_auto = oddsapi_get_odds_for_fixture(
+                    api_key=odds_api_key.strip(),
+                    sport_key=sport_key_auto,
+                    regions=odds_region,
+                    bookmaker_pref=bookmaker_pref.strip() if bookmaker_pref.strip() else "Best price",
+                    home_team_app=home_team,
+                    away_team_app=away_team,
+                )
+            found_any = any(v is not None for v in odds_auto.values())
+            if not found_any:
+                st.info("Não encontrei odds automáticas (ou o match do jogo ficou fraco). Use Manual ou ajuste o Sport key/bookmaker.")
+        except Exception as e:
+            st.warning(f"Falha ao buscar odds na The Odds API: {e}")
+
+
+# =========================
 # ML + Confiança + Alertas + Recomendação + Texto
 # =========================
 
@@ -1028,6 +1481,12 @@ if use_ml:
 
         # ✅ Recomendações respeitando perfil de risco
         recs = recommended_markets(probsP, probsM, diffs_pp, profile=risk_profile)
+
+        # ✅ Atualiza probs finais para EV: média Poisson + ML
+        probs_final = {k: 0.5 * (probsP[k] + probsM[k]) for k in MARKET_LABELS.keys()}
+        probs_final_label = "Média (Poisson + ML)"
+        confidence_score_final = int(score)
+        confidence_label_final = str(label)
 
         st.subheader("Comparação — Poisson vs ML (RandomForest) + Confiança")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -1146,5 +1605,85 @@ if use_ml:
 
     except Exception as e:
         st.error(f"Falha ao treinar/rodar ML: {e}")
+
+
+# =========================
+# EV (Valor Esperado) — sempre disponível
+# =========================
+
+st.divider()
+st.subheader("💰 EV — Expectativa de Valor (EV+ / EV-)")
+
+st.caption(
+    f"Probabilidade usada: **{probs_final_label}**. "
+    + (f"Confiança: **{confidence_score_final}/100 ({confidence_label_final})**." if confidence_score_final is not None else "Confiança: (ML desligado/indisponível).")
+)
+
+# Mostrar odds automáticas encontradas (se houver)
+with st.expander("📌 Odds automáticas detectadas (The Odds API)"):
+    if odds_source != "The Odds API":
+        st.info("Fonte de odds está em Manual.")
+    else:
+        st.write(f"Sport key usado: **{sport_key_auto}** | Região: **{odds_region}** | Bookmaker: **{bookmaker_pref}**")
+        df_auto = pd.DataFrame([{"Mercado": MARKET_LABELS[k], "Odd": odds_auto.get(k, None)} for k in MARKET_LABELS.keys()])
+        st.dataframe(df_auto, use_container_width=True)
+
+market_key = st.selectbox(
+    "Mercado para calcular EV",
+    list(MARKET_LABELS.keys()),
+    format_func=lambda k: MARKET_LABELS[k],
+    index=0
+)
+
+p_model = clamp_prob(float(probs_final[market_key]))
+fair = fair_odds(p_model)
+
+# Odds: preferir automática se veio da API e se o usuário escolheu API
+odd_auto_value = odds_auto.get(market_key, None) if odds_source == "The Odds API" else None
+
+odds_mode = st.radio(
+    "Fonte da odd",
+    ["Automática (The Odds API)", "Manual"] if odd_auto_value is not None else ["Manual"],
+    index=0 if odd_auto_value is not None else 0,
+    horizontal=True
+)
+
+odd_used: float
+if odds_mode.startswith("Automática") and odd_auto_value is not None:
+    odd_used = float(odd_auto_value)
+    st.info(f"Odd automática: **{odd_used:.2f}**")
+else:
+    odd_used = float(st.number_input("Odd decimal (ex.: 1.85)", min_value=1.01, max_value=100.0, value=1.85, step=0.01))
+
+ev = expected_value(p_model, odd_used)
+ev_pct = ev * 100.0
+
+ev_adj = ev
+if confidence_score_final is not None:
+    ev_adj = ev * (confidence_score_final / 100.0)
+
+ev_adj_pct = ev_adj * 100.0
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Prob. do modelo", f"{p_model*100:.2f}%")
+c2.metric("Odd justa (1/p)", f"{fair:.2f}" if fair is not None else "—")
+c3.metric("EV (%)", f"{ev_pct:+.2f}%")
+c4.metric("EV ajustado confiança (%)", f"{ev_adj_pct:+.2f}%" if confidence_score_final is not None else "—")
+
+if ev > 0:
+    st.success("✅ **EV+ (Valor Esperado Positivo)** — tendência favorável no longo prazo (se o modelo estiver bem calibrado).")
+else:
+    st.error("❌ **EV- (Valor Esperado Negativo)** — a odd não compensa a probabilidade estimada pelo modelo.")
+
+with st.expander("ℹ️ Como interpretar o EV"):
+    st.markdown(
+        """
+- Fórmula: **EV = p × odd − 1**
+- **EV > 0** → Expectativa Positiva (EV+)  
+- **EV < 0** → Expectativa Negativa (EV-)  
+- **Odd justa**: **1/p** (se o mercado paga acima disso, tende a ser EV+)
+- Quando ML está ligado, mostramos também **EV ajustado**: **EV × (confiança/100)** (heurística de risco).
+"""
+    )
 
 st.caption("Dica: perfil de risco muda o ranking; alerta de extremos avisa quando λ está fora do padrão esperado.")
